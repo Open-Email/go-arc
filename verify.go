@@ -18,6 +18,78 @@ type VerifyResult struct {
 	ChainValid     bool     // the ARC chain is intact and cryptographically valid
 	Instance       int      // highest ARC instance number (0 = no ARC headers)
 	FailureReasons []string // why validation failed, empty on success
+
+	// Instances reports what each ARC set in the chain actually says,
+	// ordered OLDEST FIRST (i=1 .. i=N). It is populated whenever ARC
+	// headers were found — a failing chain included, so a caller can log
+	// who sealed a chain it just rejected.
+	//
+	// It exists because Pass alone cannot support a trust decision.
+	// RFC 8617 5.2 verifies only the NEWEST ARC-Message-Signature, so a
+	// chain can validate while an attacker holds the newest set: they take
+	// a genuinely sealed message, replace the body, and add their own set
+	// with cv=pass. A caller that wants to act on a chain's contents must
+	// therefore see EVERY sealer, not just that it passed.
+	Instances []InstanceResult
+}
+
+// InstanceResult is what one ARC set claims: who sealed it, who signed the
+// message at that hop, the chain status it declared, and the authentication
+// results it recorded.
+type InstanceResult struct {
+	// Instance is the i= tag shared by the set's three headers.
+	Instance int
+	// Sealer is the ARC-Seal d= — the ADMD that vouched for the chain at
+	// this hop, and the identity whose key verified the seal.
+	Sealer string
+	// Signer is the ARC-Message-Signature d=. Normally equal to Sealer;
+	// RFC 8617 does not require it, so both are reported.
+	Signer string
+	// ChainStatus is the seal's cv= exactly as found. Verify has already
+	// rejected the chain if it is not none at i=1 and pass above, so on a
+	// passing result this carries no new information — it is here for the
+	// failing ones.
+	ChainStatus ChainStatus
+	// AuthResults is the ARC-Authentication-Results payload with the i=
+	// tag stripped and folds removed: the authserv-id followed by the
+	// results that hop observed, e.g.
+	// "mx.example.com; spf=pass smtp.mailfrom=a@b; dmarc=pass header.from=b".
+	// It is an unverified CLAIM by Sealer, meaningful only to a caller that
+	// trusts that domain.
+	AuthResults string
+}
+
+// OldestInstance returns the i=1 ARC set: the hop that received the message
+// from its ORIGINATOR and is therefore the only one whose authentication
+// results describe the original sender rather than a previous forwarder.
+//
+// This is the set a DMARC override must read (RFC 8617 7.2.1). Every later
+// AAR reports what that hop saw AFTER the message had already been forwarded
+// — typically a broken DKIM signature and an SPF pass for the forwarder — so
+// reading the newest one answers a different question than the one being
+// asked.
+func (r *VerifyResult) OldestInstance() (InstanceResult, bool) {
+	if r == nil {
+		return InstanceResult{}, false
+	}
+	for _, inst := range r.Instances {
+		if inst.Instance == 1 {
+			return inst, true
+		}
+	}
+	return InstanceResult{}, false
+}
+
+// OldestAuthResults returns the i=1 ARC-Authentication-Results payload, the
+// i= tag stripped. See OldestInstance for why it is the oldest and not the
+// newest, and LatestARCAuthResults for the counterpart that is NOT usable for
+// a trust decision.
+func (r *VerifyResult) OldestAuthResults() (string, bool) {
+	inst, ok := r.OldestInstance()
+	if !ok || inst.AuthResults == "" {
+		return "", false
+	}
+	return inst.AuthResults, true
 }
 
 // VerifyOptions configures Verify.
@@ -68,7 +140,11 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		return &VerifyResult{Pass: true, ChainValid: true, Instance: 0}, nil
 	}
 
-	result := &VerifyResult{Instance: maxInstance, FailureReasons: problems}
+	result := &VerifyResult{
+		Instance:       maxInstance,
+		FailureReasons: problems,
+		Instances:      collectInstances(sets, maxInstance),
+	}
 	if maxInstance > MaxChainLength {
 		result.FailureReasons = append(result.FailureReasons,
 			fmt.Sprintf("ARC instance %d exceeds the RFC 8617 limit of %d", maxInstance, MaxChainLength))
@@ -142,6 +218,41 @@ func extractARCSets(headers []rawHeader) (map[int]*arcSet, int, []string) {
 		}
 	}
 	return sets, maxInstance, problems
+}
+
+// collectInstances flattens the extracted sets into the per-instance report,
+// oldest first. It reads the headers only — no cryptography — so it describes
+// a failing chain as readily as a passing one; whether any of it may be
+// BELIEVED is decided by Pass and by the caller's trust in each Sealer.
+//
+// A gap in the chain (an instance with no set) is skipped rather than filled
+// with a zero entry: validateChain has already made the gap fatal, and an
+// entry claiming instance N with an empty sealer would be a claim nobody made.
+func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
+	if maxInstance <= 0 {
+		return nil
+	}
+	out := make([]InstanceResult, 0, maxInstance)
+	for i := 1; i <= maxInstance; i++ {
+		set := sets[i]
+		if set == nil {
+			continue
+		}
+		inst := InstanceResult{Instance: i}
+		if set.hasSeal {
+			tags := parseTags(set.seal.value)
+			inst.Sealer = tags["d"]
+			inst.ChainStatus = ChainStatus(tags["cv"])
+		}
+		if set.hasAMS {
+			inst.Signer = parseTags(set.ams.value)["d"]
+		}
+		if set.hasAAR {
+			inst.AuthResults = authResultsPayload(set.aar.value)
+		}
+		out = append(out, inst)
+	}
+	return out
 }
 
 // validateChain checks completeness, cv= semantics, then every AMS and
@@ -408,20 +519,34 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 	return "", false
 }
 
+// authResultsPayload unfolds an ARC-Authentication-Results value and drops
+// the leading i= tag, leaving the authserv-id and the results — the shape an
+// ordinary Authentication-Results header has, so the same parser reads both.
+// A value without a recognizable i= tag is returned unfolded and otherwise
+// untouched: reporting it verbatim is more honest than guessing at it.
+func authResultsPayload(value string) string {
+	unfolded := strings.Join(strings.Fields(value), " ")
+	if rest, ok := strings.CutPrefix(unfolded, "i="); ok {
+		if i := strings.IndexByte(rest, ';'); i >= 0 {
+			return strings.TrimSpace(rest[i+1:])
+		}
+	}
+	return unfolded
+}
+
 // LatestARCAuthResults returns the instance number and payload
 // (authserv-id and results, the i= tag stripped) of the newest
 // ARC-Authentication-Results header, if any.
+//
+// This is the right header for a SIGNER (the newest results are what the
+// previous hop observed) and the wrong one for anybody deciding whether to
+// trust the chain's account of the ORIGINAL sender — use
+// VerifyResult.OldestAuthResults for that, and read its comment for why.
 func LatestARCAuthResults(rawMessage []byte) (int, string, bool) {
 	headers, _ := splitMessage(string(rawMessage))
 	sets, maxInstance, _ := extractARCSets(headers)
 	if maxInstance == 0 || sets[maxInstance] == nil || !sets[maxInstance].hasAAR {
 		return 0, "", false
 	}
-	value := strings.Join(strings.Fields(sets[maxInstance].aar.value), " ")
-	if rest, ok := strings.CutPrefix(value, "i="); ok {
-		if i := strings.IndexByte(rest, ';'); i >= 0 {
-			return maxInstance, strings.TrimSpace(rest[i+1:]), true
-		}
-	}
-	return maxInstance, value, true
+	return maxInstance, authResultsPayload(sets[maxInstance].aar.value), true
 }

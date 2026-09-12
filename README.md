@@ -17,6 +17,18 @@ result, err := arc.Verify(rawMessage, &arc.VerifyOptions{
 
 A message with no ARC headers passes (nothing to validate). A chain passes only if every instance 1..N is complete, every `cv=` is semantically valid (`none` at i=1, `pass` above, any `fail` is fatal), and every signature verifies.
 
+`result.Instances` reports what each set in the chain *claims* — oldest first, and populated for failing chains too:
+
+```go
+for _, inst := range result.Instances {
+    // inst.Instance, inst.Sealer (ARC-Seal d=), inst.Signer (AMS d=),
+    // inst.ChainStatus (cv=), inst.AuthResults (the AAR, i= stripped)
+}
+oldest, ok := result.OldestAuthResults() // the i=1 AAR
+```
+
+`Pass` alone cannot support a trust decision, which is why this exists. RFC 8617 §5.2 verifies only the **newest** `ARC-Message-Signature`, so an attacker can take a genuinely sealed message, replace the body, append their own set with `cv=pass`, and the chain still validates. Anything acting on a chain's contents — an RFC 8617 §7.2.1 DMARC override, say — must check **every** `Sealer` against its own trust list, and must read the **oldest** AAR: only the i=1 hop received the message from its originator, so every later AAR describes a forwarder instead. `LatestARCAuthResults` is the signer's header and the wrong one for this.
+
 ## Sign
 
 ```go

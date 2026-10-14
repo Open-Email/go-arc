@@ -3,6 +3,7 @@ package arc
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
@@ -452,3 +453,112 @@ func TestGmailFixtureStructure(t *testing.T) {
 		t.Fatalf("live verification of the Google fixture failed: %+v", live.FailureReasons)
 	}
 }
+
+// TestVerifyOnlyNewestAMSPerRFC8617 proves RFC 8617 §5.2 Step 2: only the
+// highest-instance ARC-Message-Signature is validated against the message.
+// When an intermediate forwarder (e.g. a mailing list at hop 2) validates
+// hop 1's ARC set at ingress, modifies the Subject and body (breaking i=1's
+// AMS), and seals the modified message as i=2 with cv=pass, the resulting
+// chain must validate at hop 3 (and a third hop sealing it must emit cv=pass).
+func TestVerifyOnlyNewestAMSPerRFC8617(t *testing.T) {
+	ka, kb, kc := testKeys(t)
+	lookup := dnsStub(map[string]string{
+		"sel-a._domainkey.forward-a.example": txtFor(t, ka),
+		"sel-b._domainkey.forward-b.example": txtFor(t, kb),
+		"sel-c._domainkey.forward-c.example": txtFor(t, kc),
+	})
+
+	// Hop 1 seals the original message at ingress.
+	hop1, err := Sign([]byte(baseMessage), signConfig(ka, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatalf("hop 1 Sign: %v", err)
+	}
+
+	// Hop 2 (a mailing list) validates hop 1 at ingress, then modifies Subject
+	// and appends a footer before sealing i=2 at egress. To build hop 2's valid
+	// i=2 set over the modified message while keeping hop 1's i=1 set intact,
+	// sign the modified message at hop 1+2 and splice hop 1's original i=1 set
+	// (with hop 2's ARC-Seal re-signed over hop 1's original i=1 headers).
+	modifiedRaw := strings.Replace(string(hop1.Message), "Subject: Hello there\r\n", "Subject: [list] Hello there\r\n", 1) +
+		"\r\n-- \r\nMailing list footer\r\n"
+	modHeaders, modBody := splitMessage(modifiedRaw)
+
+	// Build i=2 AAR and AMS over the modified message.
+	aar2 := foldHeader("ARC-Authentication-Results", []string{"i=2", authResultsB})
+	bodyHash := sha256.Sum256(canonicalizeBody(modBody, canonRelaxed))
+	signed := selectSignedHeaders(modHeaders)
+	var hNames []string
+	for _, h := range signed {
+		hNames = append(hNames, strings.ToLower(h.key))
+	}
+	ams2Unsigned := foldHeader("ARC-Message-Signature", []string{
+		"i=2",
+		"a=rsa-sha256",
+		"c=relaxed/relaxed",
+		"d=forward-b.example",
+		"s=sel-b",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
+		"h=" + strings.Join(hNames, ":"),
+		"b=",
+	})
+	var amsInput strings.Builder
+	for _, h := range signed {
+		amsInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	amsInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(ams2Unsigned, canonRelaxed), "\r\n"))
+	ams2Hash := sha256.Sum256([]byte(amsInput.String()))
+	ams2Sig, err := signHash(kb, ams2Hash[:])
+	if err != nil {
+		t.Fatalf("sign AMS i=2: %v", err)
+	}
+	ams2Raw, err := spliceSignature(ams2Unsigned, ams2Sig)
+	if err != nil {
+		t.Fatalf("splice AMS i=2: %v", err)
+	}
+
+	// Build i=2 ARC-Seal (cv=pass) covering i=1's intact headers plus i=2's AAR+AMS.
+	seal2Unsigned := foldHeader("ARC-Seal", []string{
+		"i=2",
+		"a=rsa-sha256",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"cv=pass",
+		"d=forward-b.example",
+		"s=sel-b",
+		"b=",
+	})
+	var sealInput strings.Builder
+	for _, h := range arcHeadersUpTo(modHeaders, 2) {
+		sealInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	sealInput.WriteString(canonicalizeHeaderRaw(aar2, canonRelaxed))
+	sealInput.WriteString(canonicalizeHeaderRaw(ams2Raw, canonRelaxed))
+	sealInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(seal2Unsigned, canonRelaxed), "\r\n"))
+	seal2Hash := sha256.Sum256([]byte(sealInput.String()))
+	seal2Sig, err := signHash(kb, seal2Hash[:])
+	if err != nil {
+		t.Fatalf("sign AS i=2: %v", err)
+	}
+	seal2Raw, err := spliceSignature(seal2Unsigned, seal2Sig)
+	if err != nil {
+		t.Fatalf("splice AS i=2: %v", err)
+	}
+
+	hop2Message := []byte(seal2Raw + ams2Raw + aar2 + modifiedRaw)
+
+	// Verify at hop 3: i=2 AMS and i=1..2 seals are valid; i=1 AMS is stale.
+	res := mustVerify(t, hop2Message, lookup)
+	if !res.Pass || !res.ChainValid {
+		t.Fatalf("expected multi-hop modified chain to pass RFC 8617 §5.2 verification, got pass=%v reasons=%v", res.Pass, res.FailureReasons)
+	}
+
+	// And sealing at hop 3 must record cv=pass.
+	hop3, err := Sign(hop2Message, signConfig(kc, "forward-c.example", "sel-c", authResultsC, lookup))
+	if err != nil {
+		t.Fatalf("hop 3 Sign: %v", err)
+	}
+	if hop3.CV != ChainPass {
+		t.Fatalf("hop 3 sealed cv=%s, want pass", hop3.CV)
+	}
+}
+

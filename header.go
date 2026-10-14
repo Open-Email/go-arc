@@ -82,7 +82,9 @@ func extractInstance(value string) int {
 			if len(rest) < 1 || len(rest) > 2 {
 				return 0
 			}
-			if rest[0] < '1' || rest[0] > '9' {
+			// The ABNF permits 1–2 DIGITs, including 01..09. Enforce the
+			// numeric lower bound below, rather than rejecting a leading zero.
+			if rest[0] < '0' || rest[0] > '9' {
 				return 0
 			}
 			if len(rest) == 2 && (rest[1] < '0' || rest[1] > '9') {

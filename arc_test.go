@@ -564,11 +564,13 @@ func TestVerifyOnlyNewestAMSPerRFC8617(t *testing.T) {
 }
 
 // TestExtractInstanceBounds verifies RFC 8617 §4.1.1 / §5.2 instance-value
-// syntax: 1–2 ASCII digits in the range 1..50 without leading zeros.
+// syntax: 1–2 ASCII digits with a numeric value in the range 1..50.
 func TestExtractInstanceBounds(t *testing.T) {
 	valid := map[string]int{
 		"i=1; a=rsa-sha256":   1,
 		"i=9; a=rsa-sha256":   9,
+		"i=01; a=rsa-sha256":  1,
+		"i=09; a=rsa-sha256":  9,
 		"i=10; a=rsa-sha256":  10,
 		"i=50; a=rsa-sha256":  50,
 		" i = 1 ; cv=none":    0, // space before '=' is not a valid i= prefix
@@ -582,9 +584,9 @@ func TestExtractInstanceBounds(t *testing.T) {
 
 	invalid := []string{
 		"i=0; a=rsa-sha256",
+		"i=00; a=rsa-sha256",
 		"i=-1; a=rsa-sha256",
 		"i=+1; a=rsa-sha256",
-		"i=01; a=rsa-sha256",
 		"i=001; a=rsa-sha256",
 		"i=51; a=rsa-sha256",
 		"i=99; a=rsa-sha256",
@@ -608,7 +610,6 @@ func TestVerifyInstanceTagBounds(t *testing.T) {
 	invalidTags := []string{
 		"0",
 		"-1",
-		"01",
 		"001",
 		"51",
 		"100000",
@@ -829,5 +830,54 @@ func TestVerifyAMSRequiresFromInHTag(t *testing.T) {
 	res := mustVerify(t, msg, lookup)
 	if res.Pass || res.ChainValid {
 		t.Fatalf("expected Verify to reject ARC-Message-Signature without From in h=, got %+v", res)
+	}
+}
+
+// Re-sign a genuine one-hop chain using the valid two-digit form i=01.
+// Merely editing an existing signature would fail for cryptographic reasons
+// and would not catch a parser regression.
+func TestVerifyZeroPaddedInstance(t *testing.T) {
+	msg, lookup := testChain(t, 1)
+	key, _, _ := testKeys(t)
+	headers, _ := splitMessage(string(msg))
+	var aar, ams, seal string
+	for _, h := range headers {
+		switch h.key {
+		case "ARC-Authentication-Results":
+			aar = strings.Replace(h.raw, "i=1;", "i=01;", 1)
+		case "ARC-Message-Signature":
+			ams = strings.Replace(removeSignatureValue(h.raw), "i=1;", "i=01;", 1) + "\r\n"
+		case "ARC-Seal":
+			seal = strings.Replace(removeSignatureValue(h.raw), "i=1;", "i=01;", 1) + "\r\n"
+		}
+	}
+	resign := func(unsigned, input string) string {
+		t.Helper()
+		hash := sha256.Sum256([]byte(input))
+		sig, err := signHash(key, hash[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed, err := spliceSignature(unsigned, sig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+	signedHeaders, err := selectHeaders("ARC-Message-Signature", parseTags(ams[strings.IndexByte(ams, ':')+1:])["h"], headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var amsInput strings.Builder
+	for _, h := range signedHeaders {
+		amsInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	amsInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(ams, canonRelaxed), "\r\n"))
+	ams = resign(ams, amsInput.String())
+	sealInput := canonicalizeHeaderRaw(aar, canonRelaxed) + canonicalizeHeaderRaw(ams, canonRelaxed) + strings.TrimRight(canonicalizeHeaderRaw(seal, canonRelaxed), "\r\n")
+	seal = resign(seal, sealInput)
+	res := mustVerify(t, []byte(seal+ams+aar+baseMessage), lookup)
+	if !res.Pass || !res.ChainValid || res.Instance != 1 {
+		t.Fatalf("valid chain with i=01 failed: %+v", res)
 	}
 }

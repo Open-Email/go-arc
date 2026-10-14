@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -562,3 +563,271 @@ func TestVerifyOnlyNewestAMSPerRFC8617(t *testing.T) {
 	}
 }
 
+// TestExtractInstanceBounds verifies RFC 8617 §4.1.1 / §5.2 instance-value
+// syntax: 1–2 ASCII digits in the range 1..50 without leading zeros.
+func TestExtractInstanceBounds(t *testing.T) {
+	valid := map[string]int{
+		"i=1; a=rsa-sha256":   1,
+		"i=9; a=rsa-sha256":   9,
+		"i=10; a=rsa-sha256":  10,
+		"i=50; a=rsa-sha256":  50,
+		" i = 1 ; cv=none":    0, // space before '=' is not a valid i= prefix
+		"a=rsa-sha256; i=25;": 25,
+	}
+	for input, want := range valid {
+		if got := extractInstance(input); got != want {
+			t.Errorf("extractInstance(%q) = %d, want %d", input, got, want)
+		}
+	}
+
+	invalid := []string{
+		"i=0; a=rsa-sha256",
+		"i=-1; a=rsa-sha256",
+		"i=+1; a=rsa-sha256",
+		"i=01; a=rsa-sha256",
+		"i=001; a=rsa-sha256",
+		"i=51; a=rsa-sha256",
+		"i=99; a=rsa-sha256",
+		"i=100; a=rsa-sha256",
+		"i=1000000000; a=rsa-sha256",
+		"i=9223372036854775807; a=rsa-sha256",
+		"i=1a; a=rsa-sha256",
+		"i=; a=rsa-sha256",
+	}
+	for _, input := range invalid {
+		if got := extractInstance(input); got != 0 {
+			t.Errorf("extractInstance(%q) = %d, want 0 (invalid)", input, got)
+		}
+	}
+}
+
+// TestVerifyInstanceTagBounds checks that Verify rejects out-of-range or
+// syntactically invalid i= values (RFC 8617 §5.2) and bounds Instances slice
+// allocation regardless of the raw i= value.
+func TestVerifyInstanceTagBounds(t *testing.T) {
+	invalidTags := []string{
+		"0",
+		"-1",
+		"01",
+		"001",
+		"51",
+		"100000",
+		"9223372036854775807",
+	}
+
+	for _, tag := range invalidTags {
+		t.Run("i="+tag, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Verify panicked on i=%s: %v", tag, r)
+				}
+			}()
+
+			msg := []byte(fmt.Sprintf(
+				"ARC-Seal: i=%s; a=rsa-sha256; cv=none; d=x.example; s=s; t=1; b=AAAA\r\n%s",
+				tag, baseMessage,
+			))
+
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			res, err := Verify(msg, &VerifyOptions{LookupTXT: dnsStub(nil)})
+			runtime.ReadMemStats(&after)
+
+			if err != nil {
+				t.Fatalf("Verify returned error for i=%s: %v", tag, err)
+			}
+			if res.Pass || res.ChainValid {
+				t.Fatalf("expected Verify to fail for i=%s, got %+v", tag, res)
+			}
+			if len(res.Instances) != 0 {
+				t.Errorf("expected no Instances for invalid i=%s, got %+v", tag, res.Instances)
+			}
+			allocDelta := after.TotalAlloc - before.TotalAlloc
+			if allocDelta >= 1<<20 {
+				t.Errorf("Verify allocated %d bytes (>= 1 MiB) for i=%s", allocDelta, tag)
+			}
+		})
+	}
+}
+
+// TestVerifyMultiHopCorruptedNewestSealFails verifies that validateChain does
+// not skip the newest ARC-Seal when len(sets) > 1 (RFC 8617 §5.2 Step 3).
+func TestVerifyMultiHopCorruptedNewestSealFails(t *testing.T) {
+	msg, lookup := testChain(t, 2)
+	corrupted := corruptTag(t, string(msg), "ARC-Seal", 2)
+
+	res := mustVerify(t, []byte(corrupted), lookup)
+	if res.Pass || res.ChainValid {
+		t.Fatalf("expected Verify to fail when ARC-Seal i=2 is corrupted, got %+v", res)
+	}
+}
+
+// TestVerifyMultiHopCorruptedOldestSealUnderValidNewestSealFails verifies that
+// validateChain checks every ARC-Seal from 1..N rather than only the newest:
+// when AAR(1) is modified before hop 2 seals over it, AS(2) and AMS(2) are
+// cryptographically valid over the modified headers, but AS(1) no longer
+// matches AAR(1) and the chain must fail.
+func TestVerifyMultiHopCorruptedOldestSealUnderValidNewestSealFails(t *testing.T) {
+	ka, kb, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{
+		"sel-a._domainkey.forward-a.example": txtFor(t, ka),
+		"sel-b._domainkey.forward-b.example": txtFor(t, kb),
+	})
+
+	hop1, err := Sign([]byte(baseMessage), signConfig(ka, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatalf("hop 1 Sign: %v", err)
+	}
+
+	// Edit AAR(1) after hop 1 sealed it so AS(1) becomes invalid.
+	tamperedHop1 := strings.Replace(string(hop1.Message), "dmarc=pass", "dmarc=fail", 1)
+	if tamperedHop1 == string(hop1.Message) {
+		t.Fatal("failed to edit AAR(1)")
+	}
+	modHeaders, modBody := splitMessage(tamperedHop1)
+
+	// Build a cryptographically valid i=2 set (with cv=pass) over the edited i=1 headers.
+	aar2 := foldHeader("ARC-Authentication-Results", []string{"i=2", authResultsB})
+	bodyHash := sha256.Sum256(canonicalizeBody(modBody, canonRelaxed))
+	signed := selectSignedHeaders(modHeaders)
+	var hNames []string
+	for _, h := range signed {
+		hNames = append(hNames, strings.ToLower(h.key))
+	}
+	ams2Unsigned := foldHeader("ARC-Message-Signature", []string{
+		"i=2",
+		"a=rsa-sha256",
+		"c=relaxed/relaxed",
+		"d=forward-b.example",
+		"s=sel-b",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
+		"h=" + strings.Join(hNames, ":"),
+		"b=",
+	})
+	var amsInput strings.Builder
+	for _, h := range signed {
+		amsInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	amsInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(ams2Unsigned, canonRelaxed), "\r\n"))
+	ams2Hash := sha256.Sum256([]byte(amsInput.String()))
+	ams2Sig, err := signHash(kb, ams2Hash[:])
+	if err != nil {
+		t.Fatalf("sign AMS i=2: %v", err)
+	}
+	ams2Raw, err := spliceSignature(ams2Unsigned, ams2Sig)
+	if err != nil {
+		t.Fatalf("splice AMS i=2: %v", err)
+	}
+
+	seal2Unsigned := foldHeader("ARC-Seal", []string{
+		"i=2",
+		"a=rsa-sha256",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"cv=pass",
+		"d=forward-b.example",
+		"s=sel-b",
+		"b=",
+	})
+	var sealInput strings.Builder
+	for _, h := range arcHeadersUpTo(modHeaders, 2) {
+		sealInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	sealInput.WriteString(canonicalizeHeaderRaw(aar2, canonRelaxed))
+	sealInput.WriteString(canonicalizeHeaderRaw(ams2Raw, canonRelaxed))
+	sealInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(seal2Unsigned, canonRelaxed), "\r\n"))
+	seal2Hash := sha256.Sum256([]byte(sealInput.String()))
+	seal2Sig, err := signHash(kb, seal2Hash[:])
+	if err != nil {
+		t.Fatalf("sign AS i=2: %v", err)
+	}
+	seal2Raw, err := spliceSignature(seal2Unsigned, seal2Sig)
+	if err != nil {
+		t.Fatalf("splice AS i=2: %v", err)
+	}
+
+	hop2Message := []byte(seal2Raw + ams2Raw + aar2 + tamperedHop1)
+	res := mustVerify(t, hop2Message, lookup)
+	if res.Pass || res.ChainValid {
+		t.Fatalf("expected Verify to fail when AS(1) is invalid under a valid AS(2), got %+v", res)
+	}
+}
+
+// TestVerifyAMSRequiresFromInHTag verifies that Verify rejects an
+// ARC-Message-Signature whose h= tag omits From (RFC 8617 §4.1.2 / RFC 6376 §5.4).
+func TestVerifyAMSRequiresFromInHTag(t *testing.T) {
+	ka, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{
+		"sel-a._domainkey.forward-a.example": txtFor(t, ka),
+	})
+
+	headers, body := splitMessage(baseMessage)
+	aar1 := foldHeader("ARC-Authentication-Results", []string{"i=1", authResultsA})
+	bodyHash := sha256.Sum256(canonicalizeBody(body, canonRelaxed))
+
+	// Select only To, Subject, Date (omitting From).
+	var signed []rawHeader
+	for _, want := range []string{"to", "subject", "date"} {
+		for _, h := range headers {
+			if strings.EqualFold(h.key, want) {
+				signed = append(signed, h)
+				break
+			}
+		}
+	}
+
+	ams1Unsigned := foldHeader("ARC-Message-Signature", []string{
+		"i=1",
+		"a=rsa-sha256",
+		"c=relaxed/relaxed",
+		"d=forward-a.example",
+		"s=sel-a",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
+		"h=to:subject:date",
+		"b=",
+	})
+	var amsInput strings.Builder
+	for _, h := range signed {
+		amsInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	amsInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(ams1Unsigned, canonRelaxed), "\r\n"))
+	ams1Hash := sha256.Sum256([]byte(amsInput.String()))
+	ams1Sig, err := signHash(ka, ams1Hash[:])
+	if err != nil {
+		t.Fatalf("sign AMS i=1: %v", err)
+	}
+	ams1Raw, err := spliceSignature(ams1Unsigned, ams1Sig)
+	if err != nil {
+		t.Fatalf("splice AMS i=1: %v", err)
+	}
+
+	seal1Unsigned := foldHeader("ARC-Seal", []string{
+		"i=1",
+		"a=rsa-sha256",
+		fmt.Sprintf("t=%d", fixedNow().Unix()),
+		"cv=none",
+		"d=forward-a.example",
+		"s=sel-a",
+		"b=",
+	})
+	var sealInput strings.Builder
+	sealInput.WriteString(canonicalizeHeaderRaw(aar1, canonRelaxed))
+	sealInput.WriteString(canonicalizeHeaderRaw(ams1Raw, canonRelaxed))
+	sealInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(seal1Unsigned, canonRelaxed), "\r\n"))
+	seal1Hash := sha256.Sum256([]byte(sealInput.String()))
+	seal1Sig, err := signHash(ka, seal1Hash[:])
+	if err != nil {
+		t.Fatalf("sign AS i=1: %v", err)
+	}
+	seal1Raw, err := spliceSignature(seal1Unsigned, seal1Sig)
+	if err != nil {
+		t.Fatalf("splice AS i=1: %v", err)
+	}
+
+	msg := []byte(seal1Raw + ams1Raw + aar1 + baseMessage)
+	res := mustVerify(t, msg, lookup)
+	if res.Pass || res.ChainValid {
+		t.Fatalf("expected Verify to reject ARC-Message-Signature without From in h=, got %+v", res)
+	}
+}

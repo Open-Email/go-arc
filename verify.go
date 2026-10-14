@@ -116,7 +116,8 @@ type arcSet struct {
 // A message with no ARC headers passes (there is nothing to validate).
 // A message with ARC headers passes only if every instance from 1 to N
 // is complete, every cv= value is semantically correct (none at i=1,
-// pass above), and every ARC-Message-Signature and ARC-Seal verifies
+// pass above), the newest (i=N) ARC-Message-Signature verifies
+// cryptographically, and every ARC-Seal from 1 to N verifies
 // cryptographically.
 func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 	if opts == nil {
@@ -143,12 +144,13 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 	result := &VerifyResult{
 		Instance:       maxInstance,
 		FailureReasons: problems,
-		Instances:      collectInstances(sets, maxInstance),
 	}
-	if maxInstance > MaxChainLength {
+	if maxInstance > MaxChainLength || len(sets) > MaxChainLength {
 		result.FailureReasons = append(result.FailureReasons,
 			fmt.Sprintf("ARC instance %d exceeds the RFC 8617 limit of %d", maxInstance, MaxChainLength))
+		return result, nil
 	}
+	result.Instances = collectInstances(sets, maxInstance)
 	if len(result.FailureReasons) > 0 {
 		return result, nil
 	}
@@ -229,10 +231,10 @@ func extractARCSets(headers []rawHeader) (map[int]*arcSet, int, []string) {
 // with a zero entry: validateChain has already made the gap fatal, and an
 // entry claiming instance N with an empty sealer would be a claim nobody made.
 func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
-	if maxInstance <= 0 {
+	if maxInstance <= 0 || maxInstance > MaxChainLength {
 		return nil
 	}
-	out := make([]InstanceResult, 0, maxInstance)
+	out := make([]InstanceResult, 0, len(sets))
 	for i := 1; i <= maxInstance; i++ {
 		set := sets[i]
 		if set == nil {
@@ -479,8 +481,12 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	}
 	var out []rawHeader
 	used := make(map[int]bool)
+	hasFrom := false
 	for _, name := range strings.Split(hTag, ":") {
 		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "from" {
+			hasFrom = true
+		}
 		for i := len(headers) - 1; i >= 0; i-- {
 			if used[i] || !strings.EqualFold(headers[i].key, name) {
 				continue
@@ -489,6 +495,9 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 			used[i] = true
 			break
 		}
+	}
+	if !hasFrom {
+		return nil, fmt.Errorf("ARC-Message-Signature h= tag must include From")
 	}
 	return out, nil
 }

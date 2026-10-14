@@ -72,14 +72,29 @@ func splitMessage(raw string) ([]rawHeader, string) {
 	return headers, ""
 }
 
-// extractInstance parses the i= tag out of an ARC header value.
+// extractInstance parses the i= tag out of an ARC header value per
+// RFC 8617 §4.1.1 / §5.2 (1–2 ASCII digits, range 1..MaxChainLength).
 func extractInstance(value string) int {
 	for _, part := range strings.Split(value, ";") {
 		part = strings.TrimSpace(part)
 		if rest, ok := strings.CutPrefix(part, "i="); ok {
-			if n, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil {
-				return n
+			rest = strings.TrimSpace(rest)
+			if len(rest) < 1 || len(rest) > 2 {
+				return 0
 			}
+			// The ABNF permits 1–2 DIGITs, including 01..09. Enforce the
+			// numeric lower bound below, rather than rejecting a leading zero.
+			if rest[0] < '0' || rest[0] > '9' {
+				return 0
+			}
+			if len(rest) == 2 && (rest[1] < '0' || rest[1] > '9') {
+				return 0
+			}
+			n, err := strconv.Atoi(rest)
+			if err != nil || n < 1 || n > MaxChainLength {
+				return 0
+			}
+			return n
 		}
 	}
 	return 0

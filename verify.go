@@ -255,8 +255,9 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 	return out
 }
 
-// validateChain checks completeness, cv= semantics, then every AMS and
-// AS signature from oldest to newest.
+// validateChain checks completeness, cv= semantics, the newest AMS
+// (RFC 8617 §5.2 Step 2), and every AS signature from oldest to newest
+// (RFC 8617 §5.2 Step 3).
 func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxInstance int, lookup LookupTXT, logger *slog.Logger) (bool, []string) {
 	// Completeness: every instance 1..N with all three headers.
 	for i := 1; i <= maxInstance; i++ {
@@ -285,12 +286,10 @@ func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxIns
 	}
 
 	_, body := splitMessage(raw)
-	for i := 1; i <= maxInstance; i++ {
-		if err := verifyMessageSignature(headers, body, i, lookup); err != nil {
-			reason := fmt.Sprintf("ARC-Message-Signature verification failed at instance %d: %v", i, err)
-			logger.Debug(reason)
-			return false, []string{reason}
-		}
+	if err := verifyMessageSignature(headers, body, maxInstance, lookup); err != nil {
+		reason := fmt.Sprintf("ARC-Message-Signature verification failed at instance %d: %v", maxInstance, err)
+		logger.Debug(reason)
+		return false, []string{reason}
 	}
 	for i := 1; i <= maxInstance; i++ {
 		if err := verifySeal(headers, i, lookup); err != nil {

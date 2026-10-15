@@ -154,8 +154,8 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 	for _, h := range signed {
 		hNames = append(hNames, strings.ToLower(h.key))
 	}
-	if len(hNames) == 0 {
-		return nil, fmt.Errorf("arc: message has none of the signable headers (no From?)")
+	if len(hNames) == 0 || hNames[0] != "from" {
+		return nil, fmt.Errorf("arc: message has no From header")
 	}
 
 	amsTags := []string{

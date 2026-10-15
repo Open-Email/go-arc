@@ -534,10 +534,8 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 // untouched: reporting it verbatim is more honest than guessing at it.
 func authResultsPayload(value string) string {
 	unfolded := strings.Join(strings.Fields(value), " ")
-	if rest, ok := strings.CutPrefix(unfolded, "i="); ok {
-		if i := strings.IndexByte(rest, ';'); i >= 0 {
-			return strings.TrimSpace(rest[i+1:])
-		}
+	if n, rest, _ := parseInstanceClause(unfolded); n > 0 && strings.HasPrefix(rest, ";") {
+		return strings.TrimSpace(rest[1:])
 	}
 	return unfolded
 }

@@ -179,6 +179,15 @@ func skipCFWS(s string) (string, bool) {
 // Malformed tags are skipped; required-tag enforcement is the caller's.
 func parseTags(value string) map[string]string {
 	tags := make(map[string]string)
+	// The ARC instance clause permits comments containing semicolons
+	// and tag-shaped text. Only the following tag-list contains tags.
+	if n, rest, matched := parseInstanceClause(value); matched {
+		if n == 0 {
+			return tags
+		}
+		tags["i"] = strconv.Itoa(n)
+		value = strings.TrimPrefix(rest, ";")
+	}
 	for _, part := range strings.Split(value, ";") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -277,13 +286,21 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 // header, per RFC 6376 §3.7 (the signature header is hashed with a null
 // b= value). It walks tag STARTS (after the header colon or a ';'), so
 // a "b=" occurring inside another tag's folded base64 value — 'b'
-// followed by padding after a fold — can never match.
+// followed by padding after a fold — can never match. The ARC instance
+// clause is skipped as a whole so its comments remain signed verbatim.
 func removeSignatureValue(raw string) string {
 	colon := strings.IndexByte(raw, ':')
 	if colon < 0 {
 		return raw
 	}
 	i := colon + 1
+	if n, rest, matched := parseInstanceClause(raw[i:]); matched {
+		if n == 0 || rest == "" {
+			return raw
+		}
+		// rest starts at the semicolon after the complete instance clause.
+		i = len(raw) - len(rest) + 1
+	}
 	for i < len(raw) {
 		// Skip FWS to the start of the next tag.
 		j := i

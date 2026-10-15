@@ -568,19 +568,19 @@ func TestVerifyOnlyNewestAMSPerRFC8617(t *testing.T) {
 // numeric value in the range 1..50.
 func TestExtractInstanceBounds(t *testing.T) {
 	valid := map[string]int{
-		"i=1; a=rsa-sha256":                              1,
-		"i=9; a=rsa-sha256":                              9,
-		"i=01; a=rsa-sha256":                             1,
-		"i=09; a=rsa-sha256":                             9,
-		"i=10; a=rsa-sha256":                             10,
-		"i=50; a=rsa-sha256":                             50,
-		"i =1; a=rsa-sha256":                             1,
-		"i= 1; a=rsa-sha256":                             1,
-		" i = 1 ; cv=none":                               1,
-		"i=1 (comment); mx.example.com; spf=pass":        1,
-		"(c1) i (c2) = (c3) 09 (c4 (nested)); cv=none":   9,
-		"a=rsa-sha256; i=25;":                            25,
-		"a=rsa-sha256; i = 25 (comment); d=example.org":  25,
+		"i=1; a=rsa-sha256":                             1,
+		"i=9; a=rsa-sha256":                             9,
+		"i=01; a=rsa-sha256":                            1,
+		"i=09; a=rsa-sha256":                            9,
+		"i=10; a=rsa-sha256":                            10,
+		"i=50; a=rsa-sha256":                            50,
+		"i =1; a=rsa-sha256":                            1,
+		"i= 1; a=rsa-sha256":                            1,
+		" i = 1 ; cv=none":                              1,
+		"i=1 (comment); mx.example.com; spf=pass":       1,
+		"(c1) i (c2) = (c3) 09 (c4 (nested)); cv=none":  9,
+		"a=rsa-sha256; i=25;":                           25,
+		"a=rsa-sha256; i = 25 (comment); d=example.org": 25,
 	}
 	for input, want := range valid {
 		if got := extractInstance(input); got != want {
@@ -957,4 +957,3 @@ func TestSignRefusesWithoutFromHeader(t *testing.T) {
 		t.Fatal("Sign accepted a message without a From header")
 	}
 }
-

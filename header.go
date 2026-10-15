@@ -73,37 +73,121 @@ func splitMessage(raw string) ([]rawHeader, string) {
 }
 
 // extractInstance parses the i= tag out of an ARC header value per
-// RFC 8617 §4.1.1 / §5.2 (1–2 ASCII digits, range 1..MaxChainLength).
+// RFC 8617 §3.9 / §4.1.1 / §5.2 ([CFWS] "i" [CFWS] "=" [CFWS] 1*2DIGIT,
+// range 1..MaxChainLength).
 func extractInstance(value string) int {
-	for _, part := range strings.Split(value, ";") {
-		part = strings.TrimSpace(part)
-		if rest, ok := strings.CutPrefix(part, "i="); ok {
-			rest = strings.TrimSpace(rest)
-			if len(rest) < 1 || len(rest) > 2 {
-				return 0
-			}
-			// The ABNF permits 1–2 DIGITs, including 01..09. Enforce the
-			// numeric lower bound below, rather than rejecting a leading zero.
-			if rest[0] < '0' || rest[0] > '9' {
-				return 0
-			}
-			if len(rest) == 2 && (rest[1] < '0' || rest[1] > '9') {
-				return 0
-			}
-			n, err := strconv.Atoi(rest)
-			if err != nil || n < 1 || n > MaxChainLength {
-				return 0
-			}
+	for s := value; s != ""; {
+		if n, _, matched := parseInstanceClause(s); matched {
 			return n
 		}
+		semi := strings.IndexByte(s, ';')
+		if semi < 0 {
+			return 0
+		}
+		s = s[semi+1:]
 	}
 	return 0
+}
+
+// parseInstanceClause checks whether s begins with an RFC 8617 §3.9
+// instance tag ([CFWS] "i" [CFWS] "=" [CFWS] 1*2DIGIT [CFWS]) followed
+// by either end-of-string or ';'.
+//
+// matched reports whether s started with an "i=" tag name (or had
+// malformed leading CFWS); when matched is true and n is 0, the tag
+// value is invalid and callers must fail closed rather than searching
+// later tags.
+func parseInstanceClause(s string) (n int, rest string, matched bool) {
+	s, ok := skipCFWS(s)
+	if !ok {
+		return 0, "", true
+	}
+	if len(s) == 0 || s[0] != 'i' {
+		return 0, "", false
+	}
+	s, ok = skipCFWS(s[1:])
+	if !ok {
+		return 0, "", true
+	}
+	if len(s) == 0 || s[0] != '=' {
+		return 0, "", false
+	}
+	s, ok = skipCFWS(s[1:])
+	if !ok {
+		return 0, "", true
+	}
+	d := 0
+	for d < len(s) && s[d] >= '0' && s[d] <= '9' {
+		d++
+	}
+	if d < 1 || d > 2 {
+		return 0, "", true
+	}
+	// The ABNF permits 1–2 DIGITs, including 01..09. Enforce the
+	// numeric lower bound below, rather than rejecting a leading zero.
+	v, err := strconv.Atoi(s[:d])
+	if err != nil || v < 1 || v > MaxChainLength {
+		return 0, "", true
+	}
+	s, ok = skipCFWS(s[d:])
+	if !ok {
+		return 0, "", true
+	}
+	if len(s) > 0 && s[0] != ';' {
+		return 0, "", true
+	}
+	return v, s, true
+}
+
+// skipCFWS advances past leading RFC 5322 folding whitespace and
+// (possibly nested) parenthesized comments. It returns false if a
+// comment is unclosed or ends with a trailing backslash escape.
+func skipCFWS(s string) (string, bool) {
+	for {
+		i := 0
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+			i++
+		}
+		s = s[i:]
+		if len(s) == 0 || s[0] != '(' {
+			return s, true
+		}
+		depth := 0
+		for j := 0; j < len(s); j++ {
+			switch s[j] {
+			case '\\':
+				j++
+				if j >= len(s) {
+					return "", false
+				}
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					s = s[j+1:]
+					goto nextCFWS
+				}
+			}
+		}
+		return "", false
+	nextCFWS:
+	}
 }
 
 // parseTags splits a signature header value into its tag/value pairs.
 // Malformed tags are skipped; required-tag enforcement is the caller's.
 func parseTags(value string) map[string]string {
 	tags := make(map[string]string)
+	// The ARC instance clause permits comments containing semicolons
+	// and tag-shaped text. Only the following tag-list contains tags.
+	if n, rest, matched := parseInstanceClause(value); matched {
+		if n == 0 {
+			return tags
+		}
+		tags["i"] = strconv.Itoa(n)
+		value = strings.TrimPrefix(rest, ";")
+	}
 	for _, part := range strings.Split(value, ";") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -202,13 +286,21 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 // header, per RFC 6376 §3.7 (the signature header is hashed with a null
 // b= value). It walks tag STARTS (after the header colon or a ';'), so
 // a "b=" occurring inside another tag's folded base64 value — 'b'
-// followed by padding after a fold — can never match.
+// followed by padding after a fold — can never match. The ARC instance
+// clause is skipped as a whole so its comments remain signed verbatim.
 func removeSignatureValue(raw string) string {
 	colon := strings.IndexByte(raw, ':')
 	if colon < 0 {
 		return raw
 	}
 	i := colon + 1
+	if n, rest, matched := parseInstanceClause(raw[i:]); matched {
+		if n == 0 || rest == "" {
+			return raw
+		}
+		// rest starts at the semicolon after the complete instance clause.
+		i = len(raw) - len(rest) + 1
+	}
 	for i < len(raw) {
 		// Skip FWS to the start of the next tag.
 		j := i

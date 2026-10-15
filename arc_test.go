@@ -563,18 +563,24 @@ func TestVerifyOnlyNewestAMSPerRFC8617(t *testing.T) {
 	}
 }
 
-// TestExtractInstanceBounds verifies RFC 8617 §4.1.1 / §5.2 instance-value
-// syntax: 1–2 ASCII digits with a numeric value in the range 1..50.
+// TestExtractInstanceBounds verifies RFC 8617 §3.9 / §4.1.1 / §5.2
+// instance-value syntax: [CFWS] "i" [CFWS] "=" [CFWS] 1*2DIGIT, with a
+// numeric value in the range 1..50.
 func TestExtractInstanceBounds(t *testing.T) {
 	valid := map[string]int{
-		"i=1; a=rsa-sha256":   1,
-		"i=9; a=rsa-sha256":   9,
-		"i=01; a=rsa-sha256":  1,
-		"i=09; a=rsa-sha256":  9,
-		"i=10; a=rsa-sha256":  10,
-		"i=50; a=rsa-sha256":  50,
-		" i = 1 ; cv=none":    0, // space before '=' is not a valid i= prefix
-		"a=rsa-sha256; i=25;": 25,
+		"i=1; a=rsa-sha256":                             1,
+		"i=9; a=rsa-sha256":                             9,
+		"i=01; a=rsa-sha256":                            1,
+		"i=09; a=rsa-sha256":                            9,
+		"i=10; a=rsa-sha256":                            10,
+		"i=50; a=rsa-sha256":                            50,
+		"i =1; a=rsa-sha256":                            1,
+		"i= 1; a=rsa-sha256":                            1,
+		" i = 1 ; cv=none":                              1,
+		"i=1 (comment); mx.example.com; spf=pass":       1,
+		"(c1) i (c2) = (c3) 09 (c4 (nested)); cv=none":  9,
+		"a=rsa-sha256; i=25;":                           25,
+		"a=rsa-sha256; i = 25 (comment); d=example.org": 25,
 	}
 	for input, want := range valid {
 		if got := extractInstance(input); got != want {
@@ -594,6 +600,8 @@ func TestExtractInstanceBounds(t *testing.T) {
 		"i=1000000000; a=rsa-sha256",
 		"i=9223372036854775807; a=rsa-sha256",
 		"i=1a; a=rsa-sha256",
+		"i=1 2; a=rsa-sha256",
+		"i=1 (unclosed; a=rsa-sha256",
 		"i=; a=rsa-sha256",
 	}
 	for _, input := range invalid {
@@ -879,5 +887,73 @@ func TestVerifyZeroPaddedInstance(t *testing.T) {
 	res := mustVerify(t, []byte(seal+ams+aar+baseMessage), lookup)
 	if !res.Pass || !res.ChainValid || res.Instance != 1 {
 		t.Fatalf("valid chain with i=01 failed: %+v", res)
+	}
+}
+
+// TestVerifyInstanceWithCFWS verifies an ARC set whose i= tags use RFC 8617
+// §3.9 CFWS around '=' and a trailing comment in ARC-Authentication-Results.
+func TestVerifyInstanceWithCFWS(t *testing.T) {
+	msg, lookup := testChain(t, 1)
+	key, _, _ := testKeys(t)
+	headers, _ := splitMessage(string(msg))
+	var aar, ams, seal string
+	for _, h := range headers {
+		switch h.key {
+		case "ARC-Authentication-Results":
+			aar = strings.Replace(h.raw, "i=1;", "i = 1 (hop 1);", 1)
+		case "ARC-Message-Signature":
+			ams = strings.Replace(removeSignatureValue(h.raw), "i=1;", "i = 1;", 1) + "\r\n"
+		case "ARC-Seal":
+			seal = strings.Replace(removeSignatureValue(h.raw), "i=1;", "i = 1;", 1) + "\r\n"
+		}
+	}
+	resign := func(unsigned, input string) string {
+		t.Helper()
+		hash := sha256.Sum256([]byte(input))
+		sig, err := signHash(key, hash[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed, err := spliceSignature(unsigned, sig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+	signedHeaders, err := selectHeaders("ARC-Message-Signature", parseTags(ams[strings.IndexByte(ams, ':')+1:])["h"], headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var amsInput strings.Builder
+	for _, h := range signedHeaders {
+		amsInput.WriteString(canonicalizeHeaderRaw(h.raw, canonRelaxed))
+	}
+	amsInput.WriteString(strings.TrimRight(canonicalizeHeaderRaw(ams, canonRelaxed), "\r\n"))
+	ams = resign(ams, amsInput.String())
+	sealInput := canonicalizeHeaderRaw(aar, canonRelaxed) + canonicalizeHeaderRaw(ams, canonRelaxed) + strings.TrimRight(canonicalizeHeaderRaw(seal, canonRelaxed), "\r\n")
+	seal = resign(seal, sealInput)
+
+	signedMsg := []byte(seal + ams + aar + baseMessage)
+	res := mustVerify(t, signedMsg, lookup)
+	if !res.Pass || !res.ChainValid || res.Instance != 1 {
+		t.Fatalf("valid chain with CFWS around i=1 failed: %+v", res)
+	}
+	if got, ok := res.OldestAuthResults(); !ok || got != authResultsA {
+		t.Fatalf("OldestAuthResults() = (%q, %v), want (%q, true)", got, ok, authResultsA)
+	}
+}
+
+// TestSignRefusesWithoutFromHeader verifies that Sign refuses a message
+// that lacks a From header even when other signable headers are present,
+// rather than emitting an ARC-Message-Signature that Verify would reject.
+func TestSignRefusesWithoutFromHeader(t *testing.T) {
+	ka, _, _ := testKeys(t)
+	noFrom := strings.TrimPrefix(baseMessage, "From: Alice <alice@origin.example>\r\n")
+	if strings.Contains(noFrom, "From:") {
+		t.Fatal("failed to strip From header from test message")
+	}
+	cfg := signConfig(ka, "forward-a.example", "sel-a", authResultsA, nil)
+	if _, err := Sign([]byte(noFrom), cfg); err == nil {
+		t.Fatal("Sign accepted a message without a From header")
 	}
 }

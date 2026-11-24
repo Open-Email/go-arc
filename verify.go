@@ -535,7 +535,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 func authResultsPayload(value string) string {
 	unfolded := collapseASCIIWSP(value)
 	if n, rest, _ := parseInstanceClause(unfolded); n > 0 && strings.HasPrefix(rest, ";") {
-		return strings.TrimSpace(rest[1:])
+		return strings.Trim(rest[1:], " \t")
 	}
 	return unfolded
 }

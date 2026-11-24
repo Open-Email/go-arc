@@ -164,7 +164,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, part := range strings.Split(cfg.AuthResults, ";") {
 		part = collapseASCIIWSP(part)
 		if part != "" {
-			aarTags = append(aarTags, part)
+			aarTags = append(aarTags, foldAuthResultsClause(part))
 		}
 	}
 	aarRaw := foldHeader("ARC-Authentication-Results", aarTags)

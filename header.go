@@ -458,6 +458,65 @@ func foldHeaderNames(names []string) string {
 	return sb.String()
 }
 
+// foldAuthResultsClause folds a single already-unfolded Authentication-Results
+// clause at ASCII SP boundaries outside quoted strings so no emitted line
+// exceeds headerFoldWrap bytes (staying well under RFC 5322's 998-byte limit).
+func foldAuthResultsClause(clause string) string {
+	// Account for a continuation prefix ("\t " = 2 bytes) and trailing ";".
+	if 2+len(clause)+1 <= headerFoldWrap {
+		return clause
+	}
+	var sb strings.Builder
+	sb.Grow(len(clause) + len(clause)/headerFoldWrap*2)
+	lineLen := 2
+	inQuote := false
+	escaped := false
+	segStart := 0
+	emitted := false
+
+	emit := func(seg string) {
+		if !emitted {
+			sb.WriteString(seg)
+			lineLen += len(seg)
+			emitted = true
+			return
+		}
+		if lineLen+1+len(seg)+1 > headerFoldWrap {
+			sb.WriteString("\r\n ")
+			sb.WriteString(seg)
+			lineLen = 1 + len(seg)
+			return
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(seg)
+		lineLen += 1 + len(seg)
+	}
+
+	for i := 0; i < len(clause); i++ {
+		c := clause[i]
+		if inQuote {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		if c == '"' {
+			inQuote = true
+			continue
+		}
+		if c == ' ' {
+			emit(clause[segStart:i])
+			segStart = i + 1
+		}
+	}
+	emit(clause[segStart:])
+	return sb.String()
+}
+
 // foldHeader renders a header as "Name: tag1; tag2; ..." folded between
 // tags so no line exceeds the wrap width. Pre-folded tags (such as h=) are
 // kept intact; the b= value is spliced in after signing, so the fold

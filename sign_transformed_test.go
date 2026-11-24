@@ -345,3 +345,45 @@ func TestSignTransformedPreservesNonASCIIHeaderOctets(t *testing.T) {
 		t.Fatalf("transformed seal failed downstream verification: %+v", got)
 	}
 }
+
+func TestAuthResultsPayloadPreservesNonASCIIWhitespace(t *testing.T) {
+	// authResultsPayload must trim only ASCII WSP after the i=N; clause,
+	// preserving non-ASCII octets such as UTF-8 NBSP (0xC2 0xA0).
+	raw := " i=1;\t mx.example; dkim=pass (note:\xc2\xa0)\xc2\xa0"
+	want := "mx.example; dkim=pass (note:\xc2\xa0)\xc2\xa0"
+	if got := authResultsPayload(raw); got != want {
+		t.Fatalf("authResultsPayload(%q) = %q, want %q", raw, got, want)
+	}
+}
+
+func TestSignFoldsLongAuthResultsClauseWithinLineLimit(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+
+	// A single semicolon-less Authentication-Results clause exceeding 998 bytes
+	// (e.g., from a multi-line folded ingress Authentication-Results header
+	// carrying many properties or a long comment) must be re-folded within the
+	// RFC 5322 998-byte line limit without corrupting verification or payload.
+	var props []string
+	for i := 0; i < 45; i++ {
+		props = append(props, fmt.Sprintf("policy.prop%02d=value-%02d.example.org", i, i))
+	}
+	longAR := "forward-a.example; dkim=pass " + strings.Join(props, " ")
+
+	got, err := Sign(original8BitMessage, signConfig(key, "forward-a.example", "sel-a", longAR, lookup))
+	if err != nil {
+		t.Fatalf("Sign failed: %v", err)
+	}
+	for _, line := range strings.Split(string(got.Message), "\r\n") {
+		if len(line) > 998 {
+			t.Fatalf("emitted AAR line exceeds RFC 5322 998-byte limit (%d bytes): %.80q...", len(line), line)
+		}
+	}
+	if verified := mustVerify(t, got.Message, lookup); !verified.Pass || !verified.ChainValid {
+		t.Fatalf("folded long AAR failed verification: %+v", verified)
+	}
+	_, payload, ok := LatestARCAuthResults(got.Message)
+	if !ok || payload != longAR {
+		t.Fatalf("LatestARCAuthResults() = (%q, %v), want (%q, true)", payload, ok, longAR)
+	}
+}

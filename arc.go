@@ -45,6 +45,14 @@ var ErrChainLimit = errors.New("arc: chain already at maximum instance, refusing
 // forward the message without adding an ARC set.
 var ErrMalformedChain = errors.New("arc: existing ARC headers are unusable, refusing to extend")
 
+// ErrARCHeadersChanged is returned by SignTransformed if the outbound message
+// added, removed, reordered, or rewrote an existing ARC header.
+var ErrARCHeadersChanged = errors.New("arc: transformation changed the existing ARC headers")
+
+// ErrPriorChainFailed is returned by SignTransformed when the prior ARC chain
+// could not be validated on the original message.
+var ErrPriorChainFailed = errors.New("arc: prior chain did not validate on the original message")
+
 // ChainStatus is the cv= value of an ARC-Seal.
 type ChainStatus string
 

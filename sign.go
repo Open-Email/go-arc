@@ -162,7 +162,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	// ARC-Authentication-Results: i=N plus the ingress results, re-folded.
 	aarTags := []string{fmt.Sprintf("i=%d", instance)}
 	for _, part := range strings.Split(cfg.AuthResults, ";") {
-		part = strings.Join(strings.Fields(part), " ")
+		part = collapseASCIIWSP(part)
 		if part != "" {
 			aarTags = append(aarTags, part)
 		}
@@ -199,7 +199,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		"s=" + cfg.Selector,
 		fmt.Sprintf("t=%d", timestamp),
 		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
-		"h=" + strings.Join(hNames, ":"),
+		"h=" + foldHeaderNames(hNames),
 		"b=",
 	}
 	amsUnsigned := foldHeader("ARC-Message-Signature", amsTags)
@@ -294,7 +294,7 @@ func selectSignedHeaders(headers []rawHeader) []rawHeader {
 func arcHeaderBytes(headers []rawHeader) []string {
 	var fields []string
 	for _, h := range headers {
-		if strings.HasPrefix(strings.ToLower(h.key), "arc-") {
+		if isARCHeader(h.key) {
 			fields = append(fields, h.raw)
 		}
 	}

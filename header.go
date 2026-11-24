@@ -20,6 +20,14 @@ type rawHeader struct {
 	instance int    // parsed i= tag for ARC-* headers, else 0
 }
 
+// isARCHeader reports whether key names one of the three RFC 8617 §4.1
+// ARC header fields. Non-standard "ARC-*" fields are not part of an ARC set.
+func isARCHeader(key string) bool {
+	return strings.EqualFold(key, "ARC-Authentication-Results") ||
+		strings.EqualFold(key, "ARC-Message-Signature") ||
+		strings.EqualFold(key, "ARC-Seal")
+}
+
 // splitMessage splits a message into its header fields and body,
 // preserving each header's exact raw bytes. Both CRLF and bare LF line
 // endings are tolerated; the raw bytes are kept as found.
@@ -38,7 +46,7 @@ func splitMessage(raw string) ([]rawHeader, string) {
 			value = rawH[colon+1:]
 		}
 		h := rawHeader{key: strings.TrimSpace(key), value: value, raw: rawH}
-		if strings.HasPrefix(strings.ToLower(h.key), "arc-") {
+		if isARCHeader(h.key) {
 			h.instance = extractInstance(h.value)
 		}
 		headers = append(headers, h)
@@ -222,9 +230,36 @@ func parseCanonicalization(c string) (header, body canonicalization) {
 	return header, body
 }
 
+// collapseASCIIWSP unfolds RFC 5322 line breaks and collapses runs of
+// ASCII WSP (SP and HTAB) to a single SP, trimming leading and trailing
+// WSP. Non-ASCII octets (including UTF-8 whitespace such as U+00A0 or
+// non-UTF-8 charsets) are preserved byte for byte per RFC 6376 §3.4.2.
+func collapseASCIIWSP(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	inSpace := false
+	for i := 0; i < len(s); i++ {
+		switch b := s[i]; b {
+		case '\r', '\n':
+			continue
+		case ' ', '\t':
+			if sb.Len() > 0 {
+				inSpace = true
+			}
+		default:
+			if inSpace {
+				sb.WriteByte(' ')
+				inSpace = false
+			}
+			sb.WriteByte(b)
+		}
+	}
+	return sb.String()
+}
+
 // canonicalizeHeaderRaw applies RFC 6376 header canonicalization to one
 // raw header line (folds included). Relaxed: lowercase the field name,
-// unfold, collapse whitespace runs to a single space, trim.
+// unfold, collapse ASCII WSP runs to a single space, trim.
 func canonicalizeHeaderRaw(raw string, canon canonicalization) string {
 	if canon == canonSimple {
 		return raw
@@ -233,8 +268,8 @@ func canonicalizeHeaderRaw(raw string, canon canonicalization) string {
 	if len(parts) < 2 {
 		return raw
 	}
-	key := strings.ToLower(strings.TrimSpace(parts[0]))
-	val := strings.Join(strings.Fields(parts[1]), " ")
+	key := strings.ToLower(strings.Trim(parts[0], " \t\r\n"))
+	val := collapseASCIIWSP(parts[1])
 	return key + ":" + val + "\r\n"
 }
 
@@ -394,12 +429,40 @@ func LoadPrivateKeyPEM(pemBytes []byte) (*rsa.PrivateKey, error) {
 	}
 }
 
+const headerFoldWrap = 76
+
+// foldHeaderNames joins a colon-separated h= header list, wrapping after ':'
+// with RFC 6376 §3.5 FWS so no emitted line exceeds headerFoldWrap bytes.
+func foldHeaderNames(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	// Account for a folded continuation prefix ("\t h=" = 4 bytes) and a
+	// trailing ";" (1 byte) so the tag fits within headerFoldWrap even on
+	// its own continuation line.
+	lineLen := 4 + len(names[0])
+	sb.WriteString(names[0])
+	for _, name := range names[1:] {
+		// Reserve 1 byte for the trailing ":" or ";" after this name.
+		if lineLen+1+len(name)+1 > headerFoldWrap {
+			sb.WriteString(":\r\n\t")
+			sb.WriteString(name)
+			lineLen = 1 + len(name)
+			continue
+		}
+		sb.WriteByte(':')
+		sb.WriteString(name)
+		lineLen += 1 + len(name)
+	}
+	return sb.String()
+}
+
 // foldHeader renders a header as "Name: tag1; tag2; ..." folded between
-// tags so no line exceeds the wrap width. Tag values are never split
-// internally; the b= value is spliced in after signing, so the fold
+// tags so no line exceeds the wrap width. Pre-folded tags (such as h=) are
+// kept intact; the b= value is spliced in after signing, so the fold
 // layout is frozen before the hash is computed.
 func foldHeader(name string, tags []string) string {
-	const wrap = 76
 	var sb strings.Builder
 	sb.WriteString(name)
 	sb.WriteString(":")
@@ -409,12 +472,20 @@ func foldHeader(name string, tags []string) string {
 		if i < len(tags)-1 {
 			chunk += ";"
 		}
-		if lineLen+len(chunk) > wrap && lineLen > len(name)+1 {
+		firstLineLen := len(chunk)
+		if nl := strings.Index(chunk, "\r\n"); nl >= 0 {
+			firstLineLen = nl
+		}
+		if lineLen+firstLineLen > headerFoldWrap && lineLen > len(name)+1 {
 			sb.WriteString("\r\n\t")
 			lineLen = 1
 		}
 		sb.WriteString(chunk)
-		lineLen += len(chunk)
+		if nl := strings.LastIndex(chunk, "\r\n"); nl >= 0 {
+			lineLen = len(chunk) - nl - 2
+		} else {
+			lineLen += len(chunk)
+		}
 	}
 	sb.WriteString("\r\n")
 	return sb.String()

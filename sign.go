@@ -174,6 +174,15 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	bodyHash := sha256.Sum256(canonicalizeBody(body, canonRelaxed))
 
 	signed := selectSignedHeaders(headers)
+	if transformed {
+		// RFC 8617 §4.1.2 recommends covering DKIM-Signature fields.
+		// Include every retained occurrence in DKIM verification order.
+		for i := len(headers) - 1; i >= 0; i-- {
+			if strings.EqualFold(headers[i].key, "DKIM-Signature") {
+				signed = append(signed, headers[i])
+			}
+		}
+	}
 	hNames := make([]string, 0, len(signed))
 	for _, h := range signed {
 		hNames = append(hNames, strings.ToLower(h.key))

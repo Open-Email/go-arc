@@ -258,14 +258,17 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 		line = strings.TrimRight(line, " \t")
 		var sb strings.Builder
 		spaceSeen := false
-		for _, r := range line {
-			if r == ' ' || r == '\t' {
+		// Relaxed canonicalization changes ASCII WSP only. The original
+		// message may contain octets from a non-UTF-8 character set.
+		for i := 0; i < len(line); i++ {
+			b := line[i]
+			if b == ' ' || b == '\t' {
 				if !spaceSeen {
-					sb.WriteRune(' ')
+					sb.WriteByte(' ')
 					spaceSeen = true
 				}
 			} else {
-				sb.WriteRune(r)
+				sb.WriteByte(b)
 				spaceSeen = false
 			}
 		}

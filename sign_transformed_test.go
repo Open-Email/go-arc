@@ -2,6 +2,8 @@ package arc
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"testing"
 )
@@ -49,6 +51,41 @@ func TestSignTransformedValidatesPriorARCOnOriginal(t *testing.T) {
 	}
 	if results, ok := verified.OldestAuthResults(); !ok || results != authResultsA {
 		t.Fatalf("original ARC authentication results changed: %q", results)
+	}
+}
+
+func TestSignTransformedPreservesNonUTF8OriginalBodyHash(t *testing.T) {
+	const headers = "From: alice@origin.example\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=windows-1252\r\n"
+	const body = "  caf\xe9\t\r\n\r\n"
+	const canonicalBody = " caf\xe9\r\n"
+	original := []byte(headers + "Content-Transfer-Encoding: 8bit\r\n\r\n" + body)
+	priorKey, relayKey, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{
+		"sel-a._domainkey.forward-a.example": txtFor(t, priorKey),
+		"sel-b._domainkey.forward-b.example": txtFor(t, relayKey),
+	})
+	prior, err := Sign(original, signConfig(priorKey, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorHeaders, _ := splitMessage(string(prior.Message))
+	ams, ok := findARCHeader(priorHeaders, "ARC-Message-Signature", 1)
+	if !ok {
+		t.Fatal("original ARC message signature missing")
+	}
+	wantHash := sha256.Sum256([]byte(canonicalBody))
+	if got, want := parseTags(ams.value)["bh"], base64.StdEncoding.EncodeToString(wantHash[:]); got != want {
+		t.Fatalf("original body hash = %q, want %q for exact Windows-1252 octets", got, want)
+	}
+
+	outbound := bytes.Replace(prior.Message, []byte("Content-Transfer-Encoding: 8bit"), []byte("Content-Transfer-Encoding: base64"), 1)
+	outbound = bytes.Replace(outbound, []byte(body), []byte(base64.StdEncoding.EncodeToString([]byte(body))+"\r\n"), 1)
+	got, err := SignTransformed(prior.Message, outbound, signConfig(relayKey, "forward-b.example", "sel-b", authResultsB, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CV != ChainPass || !bytes.HasSuffix(got.Message, outbound) || !mustVerify(t, got.Message, lookup).Pass {
+		t.Fatal("rewritten message did not preserve its outbound bytes and ARC chain")
 	}
 }
 
@@ -120,5 +157,25 @@ func TestSignTransformedCreatesFirstARCSet(t *testing.T) {
 	}
 	if verified := mustVerify(t, got.Message, lookup); !verified.Pass || !verified.ChainValid || verified.Instance != 1 {
 		t.Fatalf("downstream ARC verification failed: %+v", verified)
+	}
+}
+
+func TestSignTransformedCoversRetainedDKIMHeaders(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	original := append([]byte("DKIM-Signature: v=1; d=origin.example; b=original\r\n"), original8BitMessage...)
+	outbound := append([]byte("DKIM-Signature: v=1; d=forward.example; b=local\r\n"), transformedMessage(original)...)
+	got, err := SignTransformed(original, outbound, signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mustVerify(t, got.Message, lookup).Pass {
+		t.Fatal("the unmodified transformed message must verify")
+	}
+	for _, signature := range []string{"b=original", "b=local"} {
+		tampered := bytes.Replace(got.Message, []byte(signature), []byte("b=changed"), 1)
+		if mustVerify(t, tampered, lookup).Pass {
+			t.Errorf("the transformed seal did not cover DKIM signature %q", signature)
+		}
 	}
 }

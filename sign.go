@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 )
@@ -40,7 +41,7 @@ type SignConfig struct {
 	Logger *slog.Logger
 }
 
-// SignResult is the outcome of Sign.
+// SignResult is the outcome of Sign or SignTransformed.
 type SignResult struct {
 	// Message is the input with the new ARC set prepended
 	// (ARC-Seal, ARC-Message-Signature, ARC-Authentication-Results).
@@ -72,6 +73,21 @@ var defaultSignedHeaders = []string{
 // The three headers are prepended, so the input bytes are preserved
 // verbatim: everything signed is exactly what is emitted.
 func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
+	return sign(rawMessage, rawMessage, cfg, false)
+}
+
+// SignTransformed adds an ARC set after the caller has transformed a message.
+// It validates the prior chain on the original message and signs the outbound
+// message. Pass the original bytes as they arrived, before any local changes,
+// and the final outbound bytes after every change, including local DKIM signing.
+// The outbound message must preserve all ARC-* headers and their order byte for
+// byte. If a prior chain exists, it must validate on the original. A message
+// without prior ARC gets a first-hop seal.
+func SignTransformed(original, outbound []byte, cfg *SignConfig) (*SignResult, error) {
+	return sign(original, outbound, cfg, true)
+}
+
+func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignResult, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("arc: nil SignConfig")
 	}
@@ -96,8 +112,14 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 		now = cfg.Now
 	}
 
-	raw := string(rawMessage)
-	headers, _ := splitMessage(raw)
+	raw := string(outbound)
+	headers, body := splitMessage(raw)
+	if transformed {
+		priorHeaders, _ := splitMessage(string(original))
+		if !slices.Equal(arcHeaderBytes(priorHeaders), arcHeaderBytes(headers)) {
+			return nil, ErrARCHeadersChanged
+		}
+	}
 	_, maxInstance, problems := extractARCSets(headers)
 
 	if maxInstance >= MaxChainLength {
@@ -118,13 +140,16 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 		if lookup == nil {
 			lookup = DefaultLookupTXT
 		}
-		prior, err := Verify(rawMessage, &VerifyOptions{LookupTXT: lookup, Logger: logger})
+		prior, err := Verify(original, &VerifyOptions{LookupTXT: lookup, Logger: logger})
 		if err != nil {
 			return nil, fmt.Errorf("arc: validating prior chain: %w", err)
 		}
 		if prior.Pass {
 			cv = ChainPass
 		} else {
+			if transformed {
+				return nil, fmt.Errorf("%w: %s", ErrPriorChainFailed, strings.Join(prior.FailureReasons, "; "))
+			}
 			cv = ChainFail
 			logger.Debug("prior ARC chain failed validation, sealing cv=fail",
 				"reasons", prior.FailureReasons)
@@ -137,19 +162,27 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 	// ARC-Authentication-Results: i=N plus the ingress results, re-folded.
 	aarTags := []string{fmt.Sprintf("i=%d", instance)}
 	for _, part := range strings.Split(cfg.AuthResults, ";") {
-		part = strings.Join(strings.Fields(part), " ")
+		part = collapseASCIIWSP(part)
 		if part != "" {
-			aarTags = append(aarTags, part)
+			aarTags = append(aarTags, foldAuthResultsClause(part))
 		}
 	}
 	aarRaw := foldHeader("ARC-Authentication-Results", aarTags)
 
 	// ARC-Message-Signature: DKIM-shaped, over the real body and the
 	// real headers. No v= tag — RFC 8617 defines none.
-	body := messageBody(raw)
 	bodyHash := sha256.Sum256(canonicalizeBody(body, canonRelaxed))
 
 	signed := selectSignedHeaders(headers)
+	if transformed {
+		// RFC 8617 §4.1.2 recommends covering DKIM-Signature fields.
+		// Include every retained occurrence in DKIM verification order.
+		for i := len(headers) - 1; i >= 0; i-- {
+			if strings.EqualFold(headers[i].key, "DKIM-Signature") {
+				signed = append(signed, headers[i])
+			}
+		}
+	}
 	hNames := make([]string, 0, len(signed))
 	for _, h := range signed {
 		hNames = append(hNames, strings.ToLower(h.key))
@@ -166,7 +199,7 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 		"s=" + cfg.Selector,
 		fmt.Sprintf("t=%d", timestamp),
 		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
-		"h=" + strings.Join(hNames, ":"),
+		"h=" + foldHeaderNames(hNames),
 		"b=",
 	}
 	amsUnsigned := foldHeader("ARC-Message-Signature", amsTags)
@@ -258,9 +291,14 @@ func selectSignedHeaders(headers []rawHeader) []rawHeader {
 	return out
 }
 
-func messageBody(raw string) string {
-	_, body := splitMessage(raw)
-	return body
+func arcHeaderBytes(headers []rawHeader) []string {
+	var fields []string
+	for _, h := range headers {
+		if isARCHeader(h.key) {
+			fields = append(fields, h.raw)
+		}
+	}
+	return fields
 }
 
 func signHash(key *rsa.PrivateKey, hashed []byte) (string, error) {

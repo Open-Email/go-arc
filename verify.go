@@ -315,7 +315,7 @@ func verifyMessageSignature(headers []rawHeader, body string, instance int, look
 	}
 	var recHeaders []rawHeader
 	for _, h := range headers {
-		if strings.HasPrefix(strings.ToLower(h.key), "arc-") && h.instance >= instance {
+		if isARCHeader(h.key) && h.instance >= instance {
 			continue
 		}
 		recHeaders = append(recHeaders, h)
@@ -351,7 +351,7 @@ func findARCHeader(headers []rawHeader, name string, instance int) (rawHeader, b
 func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 	var out []rawHeader
 	for _, h := range headers {
-		if !strings.HasPrefix(strings.ToLower(h.key), "arc-") {
+		if !isARCHeader(h.key) {
 			continue
 		}
 		if h.instance <= 0 || h.instance > maxInstance {
@@ -513,7 +513,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 		if !strings.EqualFold(h.key, "Authentication-Results") {
 			continue
 		}
-		value := strings.Join(strings.Fields(h.value), " ")
+		value := collapseASCIIWSP(h.value)
 		id := value
 		if i := strings.IndexByte(id, ';'); i >= 0 {
 			id = id[:i]
@@ -533,9 +533,9 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 // A value without a recognizable i= tag is returned unfolded and otherwise
 // untouched: reporting it verbatim is more honest than guessing at it.
 func authResultsPayload(value string) string {
-	unfolded := strings.Join(strings.Fields(value), " ")
+	unfolded := collapseASCIIWSP(value)
 	if n, rest, _ := parseInstanceClause(unfolded); n > 0 && strings.HasPrefix(rest, ";") {
-		return strings.TrimSpace(rest[1:])
+		return strings.Trim(rest[1:], " \t")
 	}
 	return unfolded
 }

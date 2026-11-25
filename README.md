@@ -53,6 +53,12 @@ Design decisions, all load-bearing:
 - **Everything signed is exactly what is emitted.** Headers are folded before hashing and the `b=` value is spliced into a frozen layout, so a verifier reconstructing the signed input gets identical bytes.
 - **Refusals over guesses.** A chain at instance 50 (`ErrChainLimit`) or ARC headers too damaged to number honestly (`ErrMalformedChain`) mean: forward without sealing.
 
+Use `arc.SignTransformed(original, outbound, cfg)` after modifying a message.
+Set `cfg.AuthResults` from the original ingress observations. The function validates any
+prior ARC chain against `original` and signs the final `outbound` bytes. It requires
+the same ARC headers in the same order and returns an error if the prior chain
+cannot validate.
+
 ## Testing
 
 ```sh

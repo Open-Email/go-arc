@@ -187,11 +187,11 @@ func extractARCSets(headers []rawHeader) (map[int]*arcSet, int, []string) {
 	for _, h := range headers {
 		var kind string
 		switch {
-		case strings.EqualFold(h.key, "ARC-Authentication-Results"):
+		case asciiEqualFold(h.key, "ARC-Authentication-Results"):
 			kind = "aar"
-		case strings.EqualFold(h.key, "ARC-Message-Signature"):
+		case asciiEqualFold(h.key, "ARC-Message-Signature"):
 			kind = "ams"
-		case strings.EqualFold(h.key, "ARC-Seal"):
+		case asciiEqualFold(h.key, "ARC-Seal"):
 			kind = "seal"
 		default:
 			continue
@@ -337,7 +337,7 @@ func verifySeal(headers []rawHeader, instance int, lookup LookupTXT) error {
 
 func findARCHeader(headers []rawHeader, name string, instance int) (rawHeader, bool) {
 	for _, h := range headers {
-		if strings.EqualFold(h.key, name) && h.instance == instance {
+		if asciiEqualFold(h.key, name) && h.instance == instance {
 			return h, true
 		}
 	}
@@ -357,16 +357,16 @@ func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 		if h.instance <= 0 || h.instance > maxInstance {
 			continue
 		}
-		if h.instance == maxInstance && strings.EqualFold(h.key, "ARC-Seal") {
+		if h.instance == maxInstance && asciiEqualFold(h.key, "ARC-Seal") {
 			continue
 		}
 		out = append(out, h)
 	}
 	typeOrder := func(key string) int {
 		switch {
-		case strings.EqualFold(key, "ARC-Authentication-Results"):
+		case asciiEqualFold(key, "ARC-Authentication-Results"):
 			return 1
-		case strings.EqualFold(key, "ARC-Message-Signature"):
+		case asciiEqualFold(key, "ARC-Message-Signature"):
 			return 2
 		default:
 			return 3
@@ -483,12 +483,12 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	used := make(map[int]bool)
 	hasFrom := false
 	for _, name := range strings.Split(hTag, ":") {
-		name = strings.ToLower(strings.TrimSpace(name))
+		name = asciiLower(strings.TrimSpace(name))
 		if name == "from" {
 			hasFrom = true
 		}
 		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !strings.EqualFold(headers[i].key, name) {
+			if used[i] || !asciiEqualFold(headers[i].key, name) {
 				continue
 			}
 			out = append(out, headers[i])
@@ -510,7 +510,7 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
-		if !strings.EqualFold(h.key, "Authentication-Results") {
+		if !asciiEqualFold(h.key, "Authentication-Results") {
 			continue
 		}
 		value := collapseASCIIWSP(h.value)
@@ -520,7 +520,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 		}
 		// The authserv-id may carry an optional version token.
 		fields := strings.Fields(strings.TrimSpace(id))
-		if len(fields) > 0 && strings.EqualFold(fields[0], authservID) {
+		if len(fields) > 0 && asciiEqualFold(fields[0], authservID) {
 			return value, true
 		}
 	}

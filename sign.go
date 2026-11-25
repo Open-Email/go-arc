@@ -178,14 +178,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		// RFC 8617 §4.1.2 recommends covering DKIM-Signature fields.
 		// Include every retained occurrence in DKIM verification order.
 		for i := len(headers) - 1; i >= 0; i-- {
-			if strings.EqualFold(headers[i].key, "DKIM-Signature") {
+			if asciiEqualFold(headers[i].key, "DKIM-Signature") {
 				signed = append(signed, headers[i])
 			}
 		}
 	}
 	hNames := make([]string, 0, len(signed))
 	for _, h := range signed {
-		hNames = append(hNames, strings.ToLower(h.key))
+		hNames = append(hNames, asciiLower(h.key))
 	}
 	if len(hNames) == 0 || hNames[0] != "from" {
 		return nil, fmt.Errorf("arc: message has no From header")
@@ -280,7 +280,7 @@ func selectSignedHeaders(headers []rawHeader) []rawHeader {
 	used := make(map[int]bool)
 	for _, name := range defaultSignedHeaders {
 		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !strings.EqualFold(headers[i].key, name) {
+			if used[i] || !asciiEqualFold(headers[i].key, name) {
 				continue
 			}
 			out = append(out, headers[i])

@@ -20,12 +20,46 @@ type rawHeader struct {
 	instance int    // parsed i= tag for ARC-* headers, else 0
 }
 
+// asciiEqualFold compares header field names (and authserv-ids, which are
+// domain names). RFC 5322 §3.6.8 limits a field name to printable US-ASCII,
+// so only ASCII letters fold. strings.EqualFold also folds Unicode, letting
+// "ſubject" (U+017F) or a Kelvin sign (U+212A) stand in for an ASCII name
+// that every other implementation reads as a different header: a signer
+// would then cover the look-alike instead of the real Subject.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if asciiLowerByte(a[i]) != asciiLowerByte(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiLower lowercases ASCII letters only, for the same reason.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i := range b {
+		b[i] = asciiLowerByte(b[i])
+	}
+	return string(b)
+}
+
+func asciiLowerByte(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
 // isARCHeader reports whether key names one of the three RFC 8617 §4.1
 // ARC header fields. Non-standard "ARC-*" fields are not part of an ARC set.
 func isARCHeader(key string) bool {
-	return strings.EqualFold(key, "ARC-Authentication-Results") ||
-		strings.EqualFold(key, "ARC-Message-Signature") ||
-		strings.EqualFold(key, "ARC-Seal")
+	return asciiEqualFold(key, "ARC-Authentication-Results") ||
+		asciiEqualFold(key, "ARC-Message-Signature") ||
+		asciiEqualFold(key, "ARC-Seal")
 }
 
 // splitMessage splits a message into its header fields and body,
@@ -269,7 +303,7 @@ func canonicalizeHeaderRaw(raw string, canon canonicalization) string {
 	if len(parts) < 2 {
 		return raw
 	}
-	key := strings.ToLower(strings.Trim(parts[0], " \t\r\n"))
+	key := asciiLower(strings.Trim(parts[0], " \t\r\n"))
 	val := collapseASCIIWSP(parts[1])
 	return key + ":" + val + "\r\n"
 }
@@ -286,39 +320,44 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 
 	// Relaxed: strip trailing WSP per line, collapse interior WSP runs
 	// to one space, drop trailing empty lines, CRLF line endings. An
-	// empty body canonicalizes to zero bytes.
-	lines := strings.Split(body, "\n")
-	canonical := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSuffix(line, "\r")
-		line = strings.TrimRight(line, " \t")
-		var sb strings.Builder
-		spaceSeen := false
-		// Relaxed canonicalization changes ASCII WSP only. The original
-		// message may contain octets from a non-UTF-8 character set.
-		for i := 0; i < len(line); i++ {
-			b := line[i]
-			if b == ' ' || b == '\t' {
-				if !spaceSeen {
-					sb.WriteByte(' ')
-					spaceSeen = true
-				}
-			} else {
-				sb.WriteByte(b)
-				spaceSeen = false
-			}
+	// empty body canonicalizes to zero bytes. Only ASCII WSP changes: the
+	// message may contain octets from a non-UTF-8 character set.
+	//
+	// RFC 6376 §3.4.4 does not say what a CR outside a CRLF is. This
+	// follows go-msgauth's dkim package (which smtp-out signs DKIM with)
+	// and OpenDKIM's relaxed state machine: a lone LF is a line break, and
+	// a CR ends a run of WSP as a line break does, so "a \rb" reads
+	// "a\rb", and trailing CRs and LFs are dropped like empty lines. A
+	// verifier that read the bare CR differently would fail every AMS over
+	// such a body. Pending holds a CR/LF run until content follows it.
+	var out, pending []byte
+	wsp, prevCR := false, false
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if ch == '\n' && !prevCR {
+			pending = append(pending, '\r') // a lone LF is a CRLF
 		}
-		canonical = append(canonical, sb.String())
+		prevCR = ch == '\r'
+		switch ch {
+		case ' ', '\t':
+			wsp = true
+		case '\r', '\n':
+			wsp = false
+			pending = append(pending, ch)
+		default:
+			out = append(out, pending...)
+			pending = pending[:0]
+			if wsp {
+				out = append(out, ' ')
+				wsp = false
+			}
+			out = append(out, ch)
+		}
 	}
-	for len(canonical) > 0 && canonical[len(canonical)-1] == "" {
-		canonical = canonical[:len(canonical)-1]
+	if len(out) > 0 {
+		out = append(out, '\r', '\n')
 	}
-	var out strings.Builder
-	for _, line := range canonical {
-		out.WriteString(line)
-		out.WriteString("\r\n")
-	}
-	return []byte(out.String())
+	return out
 }
 
 // removeSignatureValue empties the b= tag's value in a raw signature

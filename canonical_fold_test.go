@@ -79,3 +79,83 @@ func TestSplitAuthResultsClausesKeepsQuotedAndCommentedSemicolons(t *testing.T) 
 		t.Fatalf("splitAuthResultsClauses = %q, want %q", got, want)
 	}
 }
+
+// Header names are ASCII (RFC 5322 §3.6.8). A Unicode look-alike such as
+// "ſubject" (U+017F, which strings.EqualFold folds to "s") is a different
+// header to every other implementation, so it must never take a signed
+// name's place.
+func TestHeaderNamesFoldASCIIOnly(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"Subject", "subject", true},
+		{"ARC-SEAL", "ARC-Seal", true},
+		{"ſubject", "subject", false},
+		{"Keywords", "keywords", false}, // Kelvin sign
+		{"ARC-ſeal", "ARC-Seal", false},
+	} {
+		if got := asciiEqualFold(tc.a, tc.b); got != tc.want {
+			t.Errorf("asciiEqualFold(%q, %q) = %t, want %t", tc.a, tc.b, got, tc.want)
+		}
+	}
+	if got := asciiLower("SUBJECT-K"); got != "subject-K" {
+		t.Errorf("asciiLower changed a non-ASCII rune: %q", got)
+	}
+}
+
+func TestLookAlikeHeaderCannotTakeTheSignedSubjectSlot(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	head, body, _ := strings.Cut(baseMessage, "\r\n\r\n")
+	withDecoy := head + "\r\nſubject: decoy\r\n\r\n" + body
+
+	t.Run("signer covers the real Subject", func(t *testing.T) {
+		sealed, err := Sign([]byte(withDecoy), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !mustVerify(t, sealed.Message, lookup).Pass {
+			t.Fatal("the sealed message does not verify")
+		}
+		forged := bytes.Replace(sealed.Message, []byte("Subject: Hello there"), []byte("Subject: Pay this invoice"), 1)
+		if mustVerify(t, forged, lookup).Pass {
+			t.Fatal("the real Subject changed after sealing and the seal still verifies")
+		}
+	})
+	t.Run("verifier ignores a look-alike added later", func(t *testing.T) {
+		sealed, err := Sign([]byte(baseMessage), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, b, _ := strings.Cut(string(sealed.Message), "\r\n\r\n")
+		if res := mustVerify(t, []byte(h+"\r\nſubject: decoy\r\n\r\n"+b), lookup); !res.Pass {
+			t.Fatalf("a look-alike header added below the signed one broke verification: %+v", res)
+		}
+	})
+}
+
+// Expected values are what go-msgauth's dkim package computes, which is
+// what smtp-out signs DKIM with. A bare CR ends a run of WSP and trailing
+// CR/LF runs are dropped; nothing else changes.
+func TestRelaxedBodyCanonicalizationReadsBareCRLikeGoMsgauth(t *testing.T) {
+	for body, want := range map[string]string{
+		"":                           "",
+		"\r\n\r\n":                   "",
+		"a  b \t\r\n\r\n":            "a b\r\n",
+		" lead\r\n":                  " lead\r\n",
+		"a\nb":                       "a\r\nb\r\n",
+		"a \nb\n\n":                  "a\r\nb\r\n",
+		"a \rb\r\n":                  "a\rb\r\n",
+		"a\r b\r\n":                  "a\r b\r\n",
+		"a\r\r\n":                    "a\r\n",
+		"a \r\r\nb\r\n":              "a\r\r\nb\r\n",
+		"a\r":                        "a\r\n",
+		"Gr\xfc\xdfe \xa0 x\r\n":     "Gr\xfc\xdfe \xa0 x\r\n",
+		"a\r\n \r\n\t\r\nb\r\n\r\n ": "a\r\n\r\n\r\nb\r\n",
+	} {
+		if got := string(canonicalizeBody(body, canonRelaxed)); got != want {
+			t.Errorf("canonicalizeBody(%q) = %q, want %q", body, got, want)
+		}
+	}
+}

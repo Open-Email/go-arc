@@ -161,7 +161,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 
 	// ARC-Authentication-Results: i=N plus the ingress results, re-folded.
 	aarTags := []string{fmt.Sprintf("i=%d", instance)}
-	for _, part := range strings.Split(cfg.AuthResults, ";") {
+	for _, part := range splitAuthResultsClauses(cfg.AuthResults) {
 		part = collapseASCIIWSP(part)
 		if part != "" {
 			aarTags = append(aarTags, foldAuthResultsClause(part))

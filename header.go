@@ -231,18 +231,19 @@ func parseCanonicalization(c string) (header, body canonicalization) {
 }
 
 // collapseASCIIWSP unfolds RFC 5322 line breaks and collapses runs of
-// ASCII WSP (SP and HTAB) to a single SP, trimming leading and trailing
-// WSP. Non-ASCII octets (including UTF-8 whitespace such as U+00A0 or
-// non-UTF-8 charsets) are preserved byte for byte per RFC 6376 §3.4.2.
+// ASCII WSP (SP and HTAB), CR and LF to a single SP, trimming leading and
+// trailing ones. Non-ASCII octets (including UTF-8 whitespace such as U+00A0
+// or non-UTF-8 charsets) are preserved byte for byte per RFC 6376 §3.4.2.
 func collapseASCIIWSP(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s))
 	inSpace := false
 	for i := 0; i < len(s); i++ {
 		switch b := s[i]; b {
-		case '\r', '\n':
-			continue
-		case ' ', '\t':
+		case ' ', '\t', '\r', '\n':
+			// A CR or LF that is not part of a fold still separates words.
+			// Deleting it would let "Hel\rlo" verify as "Hello", and other
+			// verifiers (go-msgauth, OpenDKIM) read it as whitespace.
 			if sb.Len() > 0 {
 				inSpace = true
 			}
@@ -459,8 +460,11 @@ func foldHeaderNames(names []string) string {
 }
 
 // foldAuthResultsClause folds a single already-unfolded Authentication-Results
-// clause at ASCII SP boundaries outside quoted strings so no emitted line
-// exceeds headerFoldWrap bytes (staying well under RFC 5322's 998-byte limit).
+// clause at ASCII SP boundaries so no emitted line exceeds headerFoldWrap
+// bytes (staying well under RFC 5322's 998-byte limit). Every SP in the
+// clause may be folded, including those inside quoted strings and comments:
+// RFC 5322 §3.2.2 and §3.2.4 permit FWS there, and unfolding removes only
+// the inserted CRLF, so the value reads back unchanged.
 func foldAuthResultsClause(clause string) string {
 	// Account for a continuation prefix ("\t " = 2 bytes) and trailing ";".
 	if 2+len(clause)+1 <= headerFoldWrap {
@@ -469,52 +473,53 @@ func foldAuthResultsClause(clause string) string {
 	var sb strings.Builder
 	sb.Grow(len(clause) + len(clause)/headerFoldWrap*2)
 	lineLen := 2
-	inQuote := false
-	escaped := false
-	segStart := 0
-	emitted := false
-
-	emit := func(seg string) {
-		if !emitted {
+	for i, seg := range strings.Split(clause, " ") {
+		switch {
+		case i == 0:
 			sb.WriteString(seg)
 			lineLen += len(seg)
-			emitted = true
-			return
-		}
-		if lineLen+1+len(seg)+1 > headerFoldWrap {
+		case lineLen+1+len(seg)+1 > headerFoldWrap:
 			sb.WriteString("\r\n ")
 			sb.WriteString(seg)
 			lineLen = 1 + len(seg)
-			return
+		default:
+			sb.WriteByte(' ')
+			sb.WriteString(seg)
+			lineLen += 1 + len(seg)
 		}
-		sb.WriteByte(' ')
-		sb.WriteString(seg)
-		lineLen += 1 + len(seg)
 	}
+	return sb.String()
+}
 
-	for i := 0; i < len(clause); i++ {
-		c := clause[i]
-		if inQuote {
-			if escaped {
-				escaped = false
-			} else if c == '\\' {
-				escaped = true
-			} else if c == '"' {
+// splitAuthResultsClauses splits an Authentication-Results value at the ";"
+// separators between its clauses. A ";" inside a quoted string or a comment
+// is part of the value, not a separator (RFC 8601 §2.2).
+func splitAuthResultsClauses(value string) []string {
+	var clauses []string
+	start, depth := 0, 0
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		switch c := value[i]; {
+		case c == '\\' && (inQuote || depth > 0):
+			i++ // quoted-pair
+		case inQuote:
+			if c == '"' {
 				inQuote = false
 			}
-			continue
-		}
-		if c == '"' {
+		case c == '(':
+			depth++
+		case c == ')' && depth > 0:
+			depth--
+		case depth > 0:
+			// ctext, including '"'
+		case c == '"':
 			inQuote = true
-			continue
-		}
-		if c == ' ' {
-			emit(clause[segStart:i])
-			segStart = i + 1
+		case c == ';':
+			clauses = append(clauses, value[start:i])
+			start = i + 1
 		}
 	}
-	emit(clause[segStart:])
-	return sb.String()
+	return append(clauses, value[start:])
 }
 
 // foldHeader renders a header as "Name: tag1; tag2; ..." folded between

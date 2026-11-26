@@ -97,6 +97,10 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if cfg.Domain == "" || cfg.Selector == "" {
 		return nil, fmt.Errorf("arc: Domain and Selector are required")
 	}
+	// Both go into the new headers as written and into the key's DNS name.
+	if !isDNSName(cfg.Domain) || !isDNSName(cfg.Selector) {
+		return nil, fmt.Errorf("arc: Domain and Selector must be DNS names")
+	}
 	if cfg.PrivateKey == nil {
 		return nil, fmt.Errorf("arc: PrivateKey is required")
 	}
@@ -110,7 +114,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		authResults = append(authResults, collapseASCIIWSP(clause))
 	}
 	if authResults[0] == "" {
-		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id — the AAR must carry the results observed at ingress, never fabricated ones")
+		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id: the AAR must carry the results observed at ingress, never fabricated ones")
+	}
+	for _, clause := range authResults {
+		for i := 0; i < len(clause); i++ {
+			if clause[i] < ' ' || clause[i] == 0x7f {
+				return nil, fmt.Errorf("arc: AuthResults holds a control character")
+			}
+		}
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -122,10 +133,10 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	}
 
 	raw := string(outbound)
-	if strings.HasPrefix(raw, " ") || strings.HasPrefix(raw, "\t") {
-		return nil, ErrMalformedMessage
+	headers, body, defect := parseMessage(raw)
+	if defect != "" {
+		return nil, fmt.Errorf("%w: %s", ErrMalformedMessage, defect)
 	}
-	headers, body := splitMessage(raw)
 	if transformed {
 		priorHeaders, _ := splitMessage(string(original))
 		if !slices.Equal(arcHeaderBytes(priorHeaders), arcHeaderBytes(headers)) {
@@ -289,6 +300,26 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	out.WriteString(raw)
 
 	return &SignResult{Message: []byte(out.String()), Instance: instance, CV: cv}, nil
+}
+
+// isDNSName reports whether s is made of dot-separated labels of letters,
+// digits, "-" and "_", at most 253 bytes in all.
+func isDNSName(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // selectSignedHeaders picks the AMS-covered headers: for each name in

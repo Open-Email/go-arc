@@ -59,9 +59,14 @@ var ErrPriorChainFailed = errors.New("arc: prior chain did not validate on the o
 var ErrLineTooLong = errors.New("arc: a new ARC header line would exceed 998 bytes")
 
 // ErrMalformedMessage is returned by Sign and SignTransformed when the
-// message begins with a continuation line. The new headers go on top, so that
-// line would become part of the ARC-Authentication-Results.
-var ErrMalformedMessage = errors.New("arc: message begins with a header continuation line")
+// header block of the message holds a line that is neither a header field
+// (a printable ASCII name directly followed by a colon) nor the continuation
+// of one, a CR outside a line break, or more than 10,000 fields. Mail
+// software disagrees on how to read such a block, so a seal over it would
+// not mean the same message to every reader. The caller should forward the
+// message without adding an ARC set. Verify fails an existing chain on such
+// a message for the same reason.
+var ErrMalformedMessage = errors.New("arc: the header block of the message is malformed")
 
 // ChainStatus is the cv= value of an ARC-Seal.
 type ChainStatus string

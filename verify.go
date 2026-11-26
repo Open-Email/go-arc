@@ -114,11 +114,12 @@ type arcSet struct {
 // Verify validates the ARC chain of a message per RFC 8617 §5.2.
 //
 // A message with no ARC headers passes (there is nothing to validate).
-// A message with ARC headers passes only if every instance from 1 to N
-// is complete, every cv= value is semantically correct (none at i=1,
-// pass above), the newest (i=N) ARC-Message-Signature verifies
-// cryptographically, and every ARC-Seal from 1 to N verifies
-// cryptographically.
+// A message with ARC headers passes only if its header block is well
+// formed (parseMessage: a line that mail readers may read differently
+// fails the chain), every instance from 1 to N is complete, every cv=
+// value is semantically correct (none at i=1, pass above), the newest
+// (i=N) ARC-Message-Signature verifies cryptographically, and every
+// ARC-Seal from 1 to N verifies cryptographically.
 func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 	if opts == nil {
 		opts = &VerifyOptions{}
@@ -132,8 +133,7 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		lookup = DefaultLookupTXT
 	}
 
-	raw := string(rawMessage)
-	headers, _ := splitMessage(raw)
+	headers, body, defect := parseMessage(string(rawMessage))
 	sets, maxInstance, problems := extractARCSets(headers)
 
 	if maxInstance == 0 && len(sets) == 0 && len(problems) == 0 {
@@ -151,11 +151,14 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		return result, nil
 	}
 	result.Instances = collectInstances(sets, maxInstance)
+	if defect != "" {
+		result.FailureReasons = append(result.FailureReasons, "malformed header block: "+defect)
+	}
 	if len(result.FailureReasons) > 0 {
 		return result, nil
 	}
 
-	valid, reasons := validateChain(raw, headers, sets, maxInstance, lookup, logger)
+	valid, reasons := validateChain(headers, body, sets, maxInstance, lookup, logger)
 	result.ChainValid = valid
 	result.Pass = valid
 	result.FailureReasons = append(result.FailureReasons, reasons...)
@@ -260,7 +263,7 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 // validateChain checks completeness, cv= semantics, the newest AMS
 // (RFC 8617 §5.2 Step 2), and every AS signature from oldest to newest
 // (RFC 8617 §5.2 Step 3).
-func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxInstance int, lookup LookupTXT, logger *slog.Logger) (bool, []string) {
+func validateChain(headers []rawHeader, body string, sets map[int]*arcSet, maxInstance int, lookup LookupTXT, logger *slog.Logger) (bool, []string) {
 	// Completeness: every instance 1..N with all three headers.
 	for i := 1; i <= maxInstance; i++ {
 		set := sets[i]
@@ -276,7 +279,11 @@ func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxIns
 	// every later seal must claim pass; a cv=fail anywhere kills the
 	// chain without any cryptography.
 	for i := 1; i <= maxInstance; i++ {
-		cv := ChainStatus(parseTags(sets[i].seal.value)["cv"])
+		tags, err := parseTagList(sets[i].seal.value)
+		if err != nil {
+			return false, []string{fmt.Sprintf("ARC-Seal at instance %d: %v", i, err)}
+		}
+		cv := ChainStatus(tags["cv"])
 		switch {
 		case i == 1 && cv != ChainNone:
 			return false, []string{fmt.Sprintf("ARC-Seal at instance 1 must have cv=none, found %q", cv)}
@@ -287,7 +294,6 @@ func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxIns
 		}
 	}
 
-	_, body := splitMessage(raw)
 	if err := verifyMessageSignature(headers, body, maxInstance, lookup); err != nil {
 		reason := fmt.Sprintf("ARC-Message-Signature verification failed at instance %d: %v", maxInstance, err)
 		logger.Debug(reason)
@@ -384,7 +390,15 @@ func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 // verifySignature verifies one ARC signature header (AMS or AS) over
 // the given headers (and body, for AMS).
 func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body string, lookup LookupTXT) error {
-	tags := parseTags(sig.value)
+	tags, err := parseTagList(sig.value)
+	if err != nil {
+		return err
+	}
+	if _, has := tags["h"]; has && headerName == "ARC-Seal" {
+		// RFC 8617 §4.1.3: the h tag is not allowed in a seal, and one
+		// that carries it must fail.
+		return fmt.Errorf("ARC-Seal carries an h= tag")
+	}
 
 	if a := tags["a"]; a != "rsa-sha256" {
 		return fmt.Errorf("unsupported algorithm %q", a)
@@ -482,24 +496,28 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	if hTag == "" {
 		return nil, fmt.Errorf("missing h= tag")
 	}
+	// Index the fields by name once, top to bottom, so each h= entry takes
+	// the bottom-most one left in constant time. Searching the whole block
+	// per entry was quadratic in a message built for it.
+	byName := make(map[string][]int)
+	for i, h := range headers {
+		if h.key != "" {
+			name := asciiLower(h.key)
+			byName[name] = append(byName[name], i)
+		}
+	}
 	var out []rawHeader
-	used := make(map[int]bool)
 	hasFrom := false
 	for _, name := range strings.Split(hTag, ":") {
 		name = asciiLower(trimFWS(name))
-		if name == "" {
-			continue // an empty entry names no field
-		}
 		if name == "from" {
 			hasFrom = true
 		}
-		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !asciiEqualFold(headers[i].key, name) {
-				continue
-			}
-			out = append(out, headers[i])
-			used[i] = true
-			break
+		// An empty entry names no field, and a name with none left selects
+		// nothing (RFC 6376 §5.4.2).
+		if left := byName[name]; name != "" && len(left) > 0 {
+			out = append(out, headers[left[len(left)-1]])
+			byName[name] = left[:len(left)-1]
 		}
 	}
 	if !hasFrom {
@@ -515,37 +533,54 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 // authentication results stamped by its own ADMD's receiving edge.
 //
 // The match is exact. What stands before the first ";" must be the
-// authserv-id alone, or the authserv-id, whitespace and a version number
-// (RFC 8601 §2.2), once folds are removed. Anything else there, such as a
-// second word or a control or non-ASCII character, makes it another
-// server's header. The caller must still be sure that headers naming its
-// own authserv-id can only come from its own edge (RFC 8601 §5).
+// authserv-id, optionally followed by a version number, with comments and
+// folding white space allowed around both (RFC 8601 §2.2). A second word, or
+// a control or non-ASCII character next to the name, makes it another
+// server's header. Nothing is found in a message whose header block is
+// malformed (parseMessage), which Sign refuses anyway. The caller must still
+// be sure that headers naming its own authserv-id can only come from its own
+// edge (RFC 8601 §5).
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	if authservID == "" {
 		return "", false
 	}
-	headers, _ := splitMessage(string(rawMessage))
+	headers, _, defect := parseMessage(string(rawMessage))
+	if defect != "" {
+		return "", false
+	}
 	for _, h := range headers {
-		if !asciiEqualFold(h.key, "Authentication-Results") {
-			continue
+		if asciiEqualFold(h.key, "Authentication-Results") && authservIDIs(h.value, authservID) {
+			return collapseASCIIWSP(h.value), true
 		}
-		id, _, _ := strings.Cut(h.value, ";")
-		id, version, hasVersion := strings.Cut(relaxedHeaderValue(id), " ")
-		if !asciiEqualFold(id, authservID) || (hasVersion && !isDigits(version)) {
-			continue
-		}
-		return collapseASCIIWSP(h.value), true
 	}
 	return "", false
 }
 
-func isDigits(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
+// authservIDIs reports whether an Authentication-Results value opens with
+// [CFWS] authservID [CFWS version] [CFWS] and then ends or reaches ";".
+func authservIDIs(value, authservID string) bool {
+	rest, ok := skipCFWS(value)
+	if !ok {
+		return false
 	}
-	return s != ""
+	end := strings.IndexAny(rest, " \t\r\n;(")
+	if end < 0 {
+		end = len(rest)
+	}
+	if !asciiEqualFold(rest[:end], authservID) {
+		return false
+	}
+	if rest, ok = skipCFWS(rest[end:]); !ok {
+		return false
+	}
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if rest, ok = skipCFWS(rest[digits:]); !ok {
+		return false
+	}
+	return rest == "" || rest[0] == ';'
 }
 
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops

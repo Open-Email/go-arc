@@ -39,12 +39,16 @@ func asciiEqualFold(a, b string) bool {
 }
 
 // fieldName splits a raw header field at its first colon. The name is every
-// byte before the colon, less SP and HTAB directly before it (RFC 5322 §4.5.x
-// lets them stand there, and RFC 6376 §3.4.2 deletes them). Nothing else is
-// trimmed: a CR, a no-break space or any other byte in the name makes it a
-// different name, so a line such as "\rSubject: x" or "Subject\u00a0: x" can
-// never be taken for the Subject. ok is false for a line with no colon,
-// which is not a header field and matches no name.
+// byte before the colon, less SP and HTAB directly before it (the obsolete
+// syntax of RFC 5322 §4.5 lets them stand there, and RFC 6376 §3.4.2 deletes
+// them). Nothing else is trimmed: a CR, a no-break space or any other byte in
+// the name makes it a different name, so a line such as "\rSubject: x" or
+// "Subject\u00a0: x" is never taken for the Subject. ok is false for a line
+// with no colon, which matches no name.
+//
+// Matching names exactly is not enough on its own. A mail reader may still
+// take such a line for the Subject, so a message that holds one is refused
+// as a whole: see parseMessage.
 func fieldName(raw string) (name, value string, ok bool) {
 	colon := strings.IndexByte(raw, ':')
 	if colon < 0 {
@@ -111,17 +115,46 @@ func isARCHeader(key string) bool {
 		asciiEqualFold(key, "ARC-Seal")
 }
 
+// maxHeaderFields bounds the header fields of one message. Ordinary mail
+// has a few dozen; the bound keeps a message made of millions of short lines
+// from costing gigabytes.
+const maxHeaderFields = 10000
+
 // splitMessage splits a message into its header fields and body,
 // preserving each header's exact raw bytes. Both CRLF and bare LF line
 // endings are tolerated; the raw bytes are kept as found.
-//
-// The header block ends at the first empty line and nowhere else. A line
-// that holds only CRs is not empty: it stays in the block as a line that is
-// no header field, as it does for parsers that end the block at CRLF CRLF.
 func splitMessage(raw string) ([]rawHeader, string) {
-	var headers []rawHeader
-	curStart := -1
+	headers, body, _ := parseMessage(raw)
+	return headers, body
+}
 
+// parseMessage is splitMessage, and also reports the first defect of the
+// header block, or "" when every line of it is one of:
+//
+//   - a header field: a name of printable ASCII characters other than ":",
+//     directly followed by ":" (RFC 5322 §2.2);
+//   - a continuation of the field before it: a line that starts with SP or
+//     HTAB and holds something else as well.
+//
+// Anything else is read differently by different software. A line such as
+// "Subject<FF>: x" or "<BOM>Subject: x" is no Subject here, but a mail reader
+// that trims the name shows it as one. A line that holds only CRs, or only
+// white space, or no colon, ends the header block for some parsers and not
+// for others, so one of them shows as the body what another reads as header
+// fields. No reading is safe for all of them. A signature must mean the same
+// message to every reader, so Sign refuses such a message and Verify fails
+// any ARC chain on it.
+//
+// The header block ends at the first empty line (CRLF or LF alone), or at a
+// lone CR that ends the input. Past maxHeaderFields the rest of the input is
+// not read and body is "".
+func parseMessage(raw string) (headers []rawHeader, body string, defect string) {
+	curStart := -1
+	note := func(d string) {
+		if defect == "" {
+			defect = d
+		}
+	}
 	flush := func(end int) {
 		if curStart < 0 {
 			return
@@ -139,28 +172,59 @@ func splitMessage(raw string) ([]rawHeader, string) {
 	pos := 0
 	for pos < len(raw) {
 		lineEnd := strings.IndexByte(raw[pos:], '\n')
-		var next int
-		if lineEnd < 0 {
-			next = len(raw)
-		} else {
+		next := len(raw)
+		if lineEnd >= 0 {
 			next = pos + lineEnd + 1
 		}
 		line := raw[pos:next]
 		if line == "\r\n" || line == "\n" {
 			// Empty line: end of the header block.
 			flush(pos)
-			return headers, raw[next:]
+			return headers, raw[next:], defect
 		}
-		if line[0] != ' ' && line[0] != '\t' {
+		content := trimLineBreak(line)
+		if lineEnd < 0 {
+			// A CR that ends the input is the start of its last line
+			// break, as in canonicalizeBody.
+			content = strings.TrimSuffix(content, "\r")
+			if content == "" {
+				flush(pos)
+				return headers, "", defect
+			}
+		}
+		if strings.IndexByte(content, '\r') >= 0 {
+			note("a CR that is not part of a line break")
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			// A continuation line extends the current header.
+			switch {
+			case curStart < 0:
+				note("a continuation line with no header field before it")
+			case strings.Trim(content, " \t") == "":
+				note("a continuation line that holds only white space")
+			}
+		} else {
 			flush(pos)
+			if len(headers) >= maxHeaderFields {
+				note(fmt.Sprintf("more than %d header fields", maxHeaderFields))
+				return headers, "", defect
+			}
 			curStart = pos
+			colon := strings.IndexByte(content, ':')
+			if colon <= 0 {
+				note("a line that is not a header field")
+			}
+			for i := 0; i < colon; i++ {
+				if content[i] < 33 || content[i] > 126 {
+					note("a header field name that is not printable ASCII followed by a colon")
+					break
+				}
+			}
 		}
-		// Continuation lines extend the current header; nothing to do
-		// until the next flush.
 		pos = next
 	}
 	flush(len(raw))
-	return headers, ""
+	return headers, "", defect
 }
 
 // extractInstance parses the i= tag out of an ARC header value per
@@ -275,14 +339,25 @@ func skipCFWS(s string) (string, bool) {
 }
 
 // parseTags splits a signature header value into its tag/value pairs.
-// Malformed tags are skipped; required-tag enforcement is the caller's.
+// Malformed tags are skipped; required-tag enforcement is the caller's. A
+// tag given twice keeps its last value: use parseTagList wherever the value
+// decides something.
 func parseTags(value string) map[string]string {
+	tags, _ := parseTagList(value)
+	return tags
+}
+
+// parseTagList is parseTags, and also reports a tag name that occurs more
+// than once. RFC 6376 §3.2 makes the whole tag-list invalid then: one reader
+// would take the first d= or cv= and another the last.
+func parseTagList(value string) (map[string]string, error) {
 	tags := make(map[string]string)
+	var duplicate error
 	// The ARC instance clause permits comments containing semicolons
 	// and tag-shaped text. Only the following tag-list contains tags.
 	if n, rest, matched := parseInstanceClause(value); matched {
 		if n == 0 {
-			return tags
+			return tags, nil
 		}
 		tags["i"] = strconv.Itoa(n)
 		value = strings.TrimPrefix(rest, ";")
@@ -294,10 +369,13 @@ func parseTags(value string) map[string]string {
 		}
 		// RFC 6376 §3.2: [FWS] tag-name [FWS] "=" [FWS] tag-value [FWS].
 		if name = trimFWS(name); name != "" {
+			if _, seen := tags[name]; seen && duplicate == nil {
+				duplicate = fmt.Errorf("tag %q occurs more than once", name)
+			}
 			tags[name] = trimFWS(val)
 		}
 	}
-	return tags
+	return tags, duplicate
 }
 
 type canonicalization string
@@ -430,38 +508,41 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 	// is not in wire form, and match what a DATA writer sends for it: a
 	// lone LF is a line break, and a CR ending the last, unterminated line
 	// is the start of its line break.
-	lines := strings.Split(body, "\n")
-	canonical := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSuffix(line, "\r")
-		line = strings.TrimRight(line, " \t")
-		var sb strings.Builder
-		spaceSeen := false
-		// Relaxed canonicalization changes ASCII WSP only. The original
-		// message may contain octets from a non-UTF-8 character set.
-		for i := 0; i < len(line); i++ {
-			b := line[i]
-			if b == ' ' || b == '\t' {
-				if !spaceSeen {
-					sb.WriteByte(' ')
-					spaceSeen = true
-				}
-			} else {
-				sb.WriteByte(b)
-				spaceSeen = false
-			}
+	//
+	// One pass, one buffer: a body of millions of short lines must not cost
+	// a slice entry and an allocation per line.
+	out := make([]byte, 0, len(body)+2)
+	emptyLines := 0 // empty lines seen since the last line with content
+	for pos := 0; ; {
+		line, last := body[pos:], true
+		if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+			line, last = line[:nl], false
+			pos += nl + 1
 		}
-		canonical = append(canonical, sb.String())
+		line = strings.TrimRight(strings.TrimSuffix(line, "\r"), " \t")
+		if line == "" {
+			emptyLines++
+		} else {
+			for ; emptyLines > 0; emptyLines-- {
+				out = append(out, '\r', '\n')
+			}
+			inSpace := false
+			for i := 0; i < len(line); i++ {
+				switch b := line[i]; {
+				case b != ' ' && b != '\t':
+					out = append(out, b)
+					inSpace = false
+				case !inSpace:
+					out = append(out, ' ')
+					inSpace = true
+				}
+			}
+			out = append(out, '\r', '\n')
+		}
+		if last {
+			return out
+		}
 	}
-	for len(canonical) > 0 && canonical[len(canonical)-1] == "" {
-		canonical = canonical[:len(canonical)-1]
-	}
-	var out strings.Builder
-	for _, line := range canonical {
-		out.WriteString(line)
-		out.WriteString("\r\n")
-	}
-	return []byte(out.String())
 }
 
 // removeSignatureValue empties the b= tag's value in a raw signature
@@ -602,9 +683,10 @@ func foldHeaderNames(names []string) string {
 }
 
 // foldAuthResultsClause folds a single already-unfolded Authentication-Results
-// clause at ASCII SP boundaries so no emitted line exceeds headerFoldWrap
-// bytes (staying well under RFC 5322's 998-byte limit). Every SP in the
-// clause may be folded, including those inside quoted strings and comments:
+// clause at ASCII SP boundaries so that a line exceeds headerFoldWrap bytes
+// only when one run without a space is longer than that (Sign then checks
+// RFC 5322's 998-byte limit). Every SP in the clause may be folded, including
+// those inside quoted strings and comments:
 // RFC 5322 §3.2.2 and §3.2.4 permit FWS there, and unfolding removes only
 // the inserted CRLF, so the value reads back unchanged.
 func foldAuthResultsClause(clause string) string {

@@ -1,7 +1,7 @@
 package arc
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -73,33 +73,24 @@ func TestHeaderNamesFoldASCIIOnly(t *testing.T) {
 	}
 }
 
-func TestLookAlikeHeaderCannotTakeTheSignedSubjectSlot(t *testing.T) {
+// A name that only looks like "Subject" is no header field at all (its name
+// is not printable ASCII), so the message is refused: a signer does not seal
+// it, and a chain fails once such a line has been added.
+func TestLookAlikeHeaderIsRefused(t *testing.T) {
 	key, _, _ := testKeys(t)
 	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
 	head, body, _ := strings.Cut(baseMessage, "\r\n\r\n")
 	withDecoy := head + "\r\nſubject: decoy\r\n\r\n" + body
 
-	t.Run("signer covers the real Subject", func(t *testing.T) {
-		sealed, err := Sign([]byte(withDecoy), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !mustVerify(t, sealed.Message, lookup).Pass {
-			t.Fatal("the sealed message does not verify")
-		}
-		forged := bytes.Replace(sealed.Message, []byte("Subject: Hello there"), []byte("Subject: Pay this invoice"), 1)
-		if mustVerify(t, forged, lookup).Pass {
-			t.Fatal("the real Subject changed after sealing and the seal still verifies")
-		}
-	})
-	t.Run("verifier ignores a look-alike added later", func(t *testing.T) {
-		sealed, err := Sign([]byte(baseMessage), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
-		if err != nil {
-			t.Fatal(err)
-		}
-		h, b, _ := strings.Cut(string(sealed.Message), "\r\n\r\n")
-		if res := mustVerify(t, []byte(h+"\r\nſubject: decoy\r\n\r\n"+b), lookup); !res.Pass {
-			t.Fatalf("a look-alike header added below the signed one broke verification: %+v", res)
-		}
-	})
+	if got, err := Sign([]byte(withDecoy), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup)); !errors.Is(err, ErrMalformedMessage) {
+		t.Fatalf("Sign over a look-alike header = %v, %v; want ErrMalformedMessage", got, err)
+	}
+	sealed, err := Sign([]byte(baseMessage), signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, b, _ := strings.Cut(string(sealed.Message), "\r\n\r\n")
+	if res := mustVerify(t, []byte(h+"\r\nſubject: decoy\r\n\r\n"+b), lookup); res.Pass {
+		t.Fatal("the chain still verifies with a look-alike header added below the signed one")
+	}
 }

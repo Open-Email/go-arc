@@ -51,7 +51,8 @@ Design decisions, all load-bearing:
 - **`cv=` is computed, never assumed.** With prior sets present, the chain is validated (DNS required) and the seal declares the true result. On `fail`, the seal covers only the sealer's own set (§5.1.2).
 - **The seal is hand-computed, not borrowed from a DKIM signer.** It covers all prior ARC sets plus the new AAR and AMS, relaxed-canonicalized in instance order, and carries exactly the tags §4.1.3 allows: `i, a, b, cv, d, s, t` — no `bh=`, no `h=`, no `c=`, no `v=`.
 - **Everything signed is exactly what is emitted.** Headers are folded before hashing and the `b=` value is spliced into a frozen layout, so a verifier reconstructing the signed input gets identical bytes.
-- **Refusals over guesses.** A chain at instance 50 (`ErrChainLimit`) or ARC headers too damaged to number honestly (`ErrMalformedChain`) mean: forward without sealing.
+- **Refusals over guesses.** A chain at instance 50 (`ErrChainLimit`), ARC headers too damaged to number honestly (`ErrMalformedChain`), a header block that mail software reads in more than one way (`ErrMalformedMessage`) or results that cannot be folded under 998 bytes (`ErrLineTooLong`) mean: forward without sealing.
+- **A header block must read the same everywhere.** Every line of it has to be a header field (a printable ASCII name directly followed by a colon) or the continuation of one, with no CR outside a line break. A line such as `Subject<FF>: x`, a line of CRs or of white space, or a line with no colon is a Subject, a continuation or the end of the headers to one parser and not to another. `Sign` refuses such a message and `Verify` fails any chain on it.
 
 Use `arc.SignTransformed(original, outbound, cfg)` after modifying a message.
 Set `cfg.AuthResults` from the original ingress observations. The function validates any

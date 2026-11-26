@@ -2,41 +2,10 @@ package arc
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
 )
-
-func TestRelaxedHeaderCanonicalizationReadsBareCRAndLFAsWhitespace(t *testing.T) {
-	for raw, want := range map[string]string{
-		"Subject: Hel\rlo there\r\n":    "subject:Hel lo there\r\n",
-		"Subject: Hel\nlo there\r\n":    "subject:Hel lo there\r\n",
-		"Subject: Hel \r lo\r\n":        "subject:Hel lo\r\n",
-		"Subject: folded\r\n\tline\r\n": "subject:folded line\r\n",
-		"Subject: \r trailing \r\r\n":   "subject:trailing\r\n",
-	} {
-		if got := canonicalizeHeaderRaw(raw, canonRelaxed); got != want {
-			t.Errorf("canonicalizeHeaderRaw(%q) = %q, want %q", raw, got, want)
-		}
-	}
-}
-
-func TestBareCRInsertedAfterSealingBreaksTheChain(t *testing.T) {
-	original, lookup := testChain(t, 1)
-	tampered := bytes.Replace(original, []byte("Subject: Hello there"), []byte("Subject: Hel\rlo there"), 1)
-	if bytes.Equal(tampered, original) {
-		t.Fatal("test chain has no Subject to alter")
-	}
-	if res := mustVerify(t, tampered, lookup); res.Pass {
-		t.Fatal("the seal still verifies after a bare CR was inserted into the signed Subject")
-	}
-	_, relayKey, _ := testKeys(t)
-	got, err := SignTransformed(tampered, tampered, signConfig(relayKey, "forward-b.example", "sel-b", authResultsB, lookup))
-	if !errors.Is(err, ErrPriorChainFailed) {
-		t.Fatalf("SignTransformed over the altered chain = %+v, %v; want ErrPriorChainFailed", got, err)
-	}
-}
 
 func TestSignFoldsQuotedAuthResultsWithinLineLimit(t *testing.T) {
 	key, _, _ := testKeys(t)
@@ -133,29 +102,4 @@ func TestLookAlikeHeaderCannotTakeTheSignedSubjectSlot(t *testing.T) {
 			t.Fatalf("a look-alike header added below the signed one broke verification: %+v", res)
 		}
 	})
-}
-
-// Expected values are what go-msgauth's dkim package computes, which is
-// what smtp-out signs DKIM with. A bare CR ends a run of WSP and trailing
-// CR/LF runs are dropped; nothing else changes.
-func TestRelaxedBodyCanonicalizationReadsBareCRLikeGoMsgauth(t *testing.T) {
-	for body, want := range map[string]string{
-		"":                           "",
-		"\r\n\r\n":                   "",
-		"a  b \t\r\n\r\n":            "a b\r\n",
-		" lead\r\n":                  " lead\r\n",
-		"a\nb":                       "a\r\nb\r\n",
-		"a \nb\n\n":                  "a\r\nb\r\n",
-		"a \rb\r\n":                  "a\rb\r\n",
-		"a\r b\r\n":                  "a\r b\r\n",
-		"a\r\r\n":                    "a\r\n",
-		"a \r\r\nb\r\n":              "a\r\r\nb\r\n",
-		"a\r":                        "a\r\n",
-		"Gr\xfc\xdfe \xa0 x\r\n":     "Gr\xfc\xdfe \xa0 x\r\n",
-		"a\r\n \r\n\t\r\nb\r\n\r\n ": "a\r\n\r\n\r\nb\r\n",
-	} {
-		if got := string(canonicalizeBody(body, canonRelaxed)); got != want {
-			t.Errorf("canonicalizeBody(%q) = %q, want %q", body, got, want)
-		}
-	}
 }

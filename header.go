@@ -14,7 +14,7 @@ import (
 // Signatures are computed over raw bytes (canonicalized), so parsing
 // must never normalize what it stores.
 type rawHeader struct {
-	key      string // field name, surrounding whitespace trimmed
+	key      string // field name as fieldName reads it; "" if the line has no colon
 	value    string // everything after the first colon, folds preserved
 	raw      string // exact bytes including folds and trailing line break
 	instance int    // parsed i= tag for ARC-* headers, else 0
@@ -36,6 +36,55 @@ func asciiEqualFold(a, b string) bool {
 		}
 	}
 	return true
+}
+
+// fieldName splits a raw header field at its first colon. The name is every
+// byte before the colon, less SP and HTAB directly before it (RFC 5322 §4.5.x
+// lets them stand there, and RFC 6376 §3.4.2 deletes them). Nothing else is
+// trimmed: a CR, a no-break space or any other byte in the name makes it a
+// different name, so a line such as "\rSubject: x" or "Subject\u00a0: x" can
+// never be taken for the Subject. ok is false for a line with no colon,
+// which is not a header field and matches no name.
+func fieldName(raw string) (name, value string, ok bool) {
+	colon := strings.IndexByte(raw, ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return strings.TrimRight(raw[:colon], " \t"), raw[colon+1:], true
+}
+
+// trimFWS removes the bytes folding whitespace is made of (SP, HTAB, CR, LF)
+// from both ends of a tag name or value. strings.TrimSpace would also remove
+// Unicode whitespace, which no other DKIM or ARC implementation ignores.
+func trimFWS(s string) string {
+	return strings.Trim(s, " \t\r\n")
+}
+
+// stripFWS removes every SP, HTAB, CR and LF, for base64 tag values, which
+// may be folded anywhere (RFC 6376 §3.5). Any other byte is left for the
+// base64 decoder to reject.
+func stripFWS(s string) string {
+	if !strings.ContainsAny(s, " \t\r\n") {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n':
+		default:
+			sb.WriteByte(s[i])
+		}
+	}
+	return sb.String()
+}
+
+// trimLineBreak removes the one CRLF, or bare LF, that ends s.
+func trimLineBreak(s string) string {
+	if strings.HasSuffix(s, "\r\n") {
+		return s[:len(s)-2]
+	}
+	return strings.TrimSuffix(s, "\n")
 }
 
 // asciiLower lowercases ASCII letters only, for the same reason.
@@ -65,6 +114,10 @@ func isARCHeader(key string) bool {
 // splitMessage splits a message into its header fields and body,
 // preserving each header's exact raw bytes. Both CRLF and bare LF line
 // endings are tolerated; the raw bytes are kept as found.
+//
+// The header block ends at the first empty line and nowhere else. A line
+// that holds only CRs is not empty: it stays in the block as a line that is
+// no header field, as it does for parsers that end the block at CRLF CRLF.
 func splitMessage(raw string) ([]rawHeader, string) {
 	var headers []rawHeader
 	curStart := -1
@@ -74,12 +127,8 @@ func splitMessage(raw string) ([]rawHeader, string) {
 			return
 		}
 		rawH := raw[curStart:end]
-		key, value := rawH, ""
-		if colon := strings.Index(rawH, ":"); colon >= 0 {
-			key = rawH[:colon]
-			value = rawH[colon+1:]
-		}
-		h := rawHeader{key: strings.TrimSpace(key), value: value, raw: rawH}
+		key, value, _ := fieldName(rawH)
+		h := rawHeader{key: key, value: value, raw: rawH}
 		if isARCHeader(h.key) {
 			h.instance = extractInstance(h.value)
 		}
@@ -97,8 +146,8 @@ func splitMessage(raw string) ([]rawHeader, string) {
 			next = pos + lineEnd + 1
 		}
 		line := raw[pos:next]
-		if strings.TrimRight(line, "\r\n") == "" {
-			// Blank line: end of the header block.
+		if line == "\r\n" || line == "\n" {
+			// Empty line: end of the header block.
 			flush(pos)
 			return headers, raw[next:]
 		}
@@ -117,16 +166,23 @@ func splitMessage(raw string) ([]rawHeader, string) {
 // extractInstance parses the i= tag out of an ARC header value per
 // RFC 8617 §3.9 / §4.1.1 / §5.2 ([CFWS] "i" [CFWS] "=" [CFWS] 1*2DIGIT,
 // range 1..MaxChainLength).
+//
+// The tag may follow other tags. A clause that is not the instance tag ends
+// at the first ';' after any comments it opens with: a ';' inside such a
+// comment separates nothing, as inside the instance clause itself. Resuming
+// after what parseInstanceClause already read also keeps the scan linear;
+// restarting inside a nested comment made it quadratic.
 func extractInstance(value string) int {
 	for s := value; s != ""; {
-		if n, _, matched := parseInstanceClause(s); matched {
+		n, rest, matched := parseInstanceClause(s)
+		if matched {
 			return n
 		}
-		semi := strings.IndexByte(s, ';')
+		semi := strings.IndexByte(rest, ';')
 		if semi < 0 {
 			return 0
 		}
-		s = s[semi+1:]
+		s = rest[semi+1:]
 	}
 	return 0
 }
@@ -138,21 +194,22 @@ func extractInstance(value string) int {
 // matched reports whether s started with an "i=" tag name (or had
 // malformed leading CFWS); when matched is true and n is 0, the tag
 // value is invalid and callers must fail closed rather than searching
-// later tags.
+// later tags. When matched is false, rest is what follows the CFWS (and
+// the "i") that were read.
 func parseInstanceClause(s string) (n int, rest string, matched bool) {
 	s, ok := skipCFWS(s)
 	if !ok {
 		return 0, "", true
 	}
 	if len(s) == 0 || s[0] != 'i' {
-		return 0, "", false
+		return 0, s, false
 	}
 	s, ok = skipCFWS(s[1:])
 	if !ok {
 		return 0, "", true
 	}
 	if len(s) == 0 || s[0] != '=' {
-		return 0, "", false
+		return 0, s, false
 	}
 	s, ok = skipCFWS(s[1:])
 	if !ok {
@@ -231,15 +288,14 @@ func parseTags(value string) map[string]string {
 		value = strings.TrimPrefix(rest, ";")
 	}
 	for _, part := range strings.Split(value, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
+		name, val, ok := strings.Cut(part, "=")
+		if !ok {
 			continue
 		}
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) != 2 {
-			continue
+		// RFC 6376 §3.2: [FWS] tag-name [FWS] "=" [FWS] tag-value [FWS].
+		if name = trimFWS(name); name != "" {
+			tags[name] = trimFWS(val)
 		}
-		tags[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 	}
 	return tags
 }
@@ -251,23 +307,31 @@ const (
 	canonRelaxed canonicalization = "relaxed"
 )
 
-func parseCanonicalization(c string) (header, body canonicalization) {
+// parseCanonicalization reads a c= tag: "header" or "header/body", each
+// simple or relaxed, body defaulting to simple (RFC 6376 §3.5). Any other
+// value is an error; it must not be read as one of the two.
+func parseCanonicalization(c string) (header, body canonicalization, err error) {
 	if c == "" {
-		return canonSimple, canonSimple
+		return canonSimple, canonSimple, nil
 	}
-	parts := strings.Split(c, "/")
-	header = canonicalization(strings.TrimSpace(parts[0]))
-	body = canonSimple
-	if len(parts) > 1 {
-		body = canonicalization(strings.TrimSpace(parts[1]))
+	h, b, hasBody := strings.Cut(c, "/")
+	header, body = canonicalization(trimFWS(h)), canonSimple
+	if hasBody {
+		body = canonicalization(trimFWS(b))
 	}
-	return header, body
+	for _, v := range []canonicalization{header, body} {
+		if v != canonSimple && v != canonRelaxed {
+			return "", "", fmt.Errorf("unsupported canonicalization %q", c)
+		}
+	}
+	return header, body, nil
 }
 
-// collapseASCIIWSP unfolds RFC 5322 line breaks and collapses runs of
-// ASCII WSP (SP and HTAB), CR and LF to a single SP, trimming leading and
-// trailing ones. Non-ASCII octets (including UTF-8 whitespace such as U+00A0
-// or non-UTF-8 charsets) are preserved byte for byte per RFC 6376 §3.4.2.
+// collapseASCIIWSP turns each run of SP, HTAB, CR and LF into one SP and
+// trims both ends, leaving every other octet as found. It is for values that
+// are read or written again (an authserv-id, the results put into a new
+// ARC-Authentication-Results), where a CR or LF must not survive to end a
+// header line. It is NOT a canonicalization: relaxedHeaderValue is.
 func collapseASCIIWSP(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s))
@@ -275,9 +339,6 @@ func collapseASCIIWSP(s string) string {
 	for i := 0; i < len(s); i++ {
 		switch b := s[i]; b {
 		case ' ', '\t', '\r', '\n':
-			// A CR or LF that is not part of a fold still separates words.
-			// Deleting it would let "Hel\rlo" verify as "Hello", and other
-			// verifiers (go-msgauth, OpenDKIM) read it as whitespace.
 			if sb.Len() > 0 {
 				inSpace = true
 			}
@@ -292,20 +353,63 @@ func collapseASCIIWSP(s string) string {
 	return sb.String()
 }
 
+// relaxedHeaderValue applies RFC 6376 §3.4.2 to a field value, read exactly:
+// the line break of every fold is removed, every run of WSP (SP and HTAB)
+// becomes one SP, and WSP at either end goes. A fold is a line break followed
+// by WSP; a bare LF counts as a line break there because splitMessage accepts
+// bare-LF messages. A CR that is not part of a line break is an ordinary
+// octet. Reading it as whitespace would let "Hello there" be changed to
+// "Hello\rthere" under a valid signature, and deleting it would do the same
+// for "Hel\rlo".
+func relaxedHeaderValue(value string) string {
+	value = trimLineBreak(value)
+	var sb strings.Builder
+	sb.Grow(len(value))
+	inSpace := false
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if n := lineBreakLen(value[i:]); n > 0 && i+n < len(value) && (value[i+n] == ' ' || value[i+n] == '\t') {
+			i += n - 1
+			continue
+		}
+		if b == ' ' || b == '\t' {
+			inSpace = sb.Len() > 0
+			continue
+		}
+		if inSpace {
+			sb.WriteByte(' ')
+			inSpace = false
+		}
+		sb.WriteByte(b)
+	}
+	return sb.String()
+}
+
+// lineBreakLen returns the length of the CRLF or bare LF that s starts with,
+// or 0.
+func lineBreakLen(s string) int {
+	switch {
+	case strings.HasPrefix(s, "\r\n"):
+		return 2
+	case strings.HasPrefix(s, "\n"):
+		return 1
+	}
+	return 0
+}
+
 // canonicalizeHeaderRaw applies RFC 6376 header canonicalization to one
-// raw header line (folds included). Relaxed: lowercase the field name,
-// unfold, collapse ASCII WSP runs to a single space, trim.
+// raw header field (folds and final line break included). Relaxed: the
+// field name in lowercase, a colon, relaxedHeaderValue, CRLF. A line with
+// no colon is not a header field and is returned as found.
 func canonicalizeHeaderRaw(raw string, canon canonicalization) string {
 	if canon == canonSimple {
 		return raw
 	}
-	parts := strings.SplitN(raw, ":", 2)
-	if len(parts) < 2 {
+	name, value, ok := fieldName(raw)
+	if !ok {
 		return raw
 	}
-	key := asciiLower(strings.Trim(parts[0], " \t\r\n"))
-	val := collapseASCIIWSP(parts[1])
-	return key + ":" + val + "\r\n"
+	return asciiLower(name) + ":" + relaxedHeaderValue(value) + "\r\n"
 }
 
 // canonicalizeBody applies RFC 6376 body canonicalization and returns
@@ -318,46 +422,46 @@ func canonicalizeBody(body string, canon canonicalization) []byte {
 		return []byte(body + "\r\n")
 	}
 
-	// Relaxed: strip trailing WSP per line, collapse interior WSP runs
-	// to one space, drop trailing empty lines, CRLF line endings. An
-	// empty body canonicalizes to zero bytes. Only ASCII WSP changes: the
-	// message may contain octets from a non-UTF-8 character set.
-	//
-	// RFC 6376 §3.4.4 does not say what a CR outside a CRLF is. This
-	// follows go-msgauth's dkim package (which smtp-out signs DKIM with)
-	// and OpenDKIM's relaxed state machine: a lone LF is a line break, and
-	// a CR ends a run of WSP as a line break does, so "a \rb" reads
-	// "a\rb", and trailing CRs and LFs are dropped like empty lines. A
-	// verifier that read the bare CR differently would fail every AMS over
-	// such a body. Pending holds a CR/LF run until content follows it.
-	var out, pending []byte
-	wsp, prevCR := false, false
-	for i := 0; i < len(body); i++ {
-		ch := body[i]
-		if ch == '\n' && !prevCR {
-			pending = append(pending, '\r') // a lone LF is a CRLF
-		}
-		prevCR = ch == '\r'
-		switch ch {
-		case ' ', '\t':
-			wsp = true
-		case '\r', '\n':
-			wsp = false
-			pending = append(pending, ch)
-		default:
-			out = append(out, pending...)
-			pending = pending[:0]
-			if wsp {
-				out = append(out, ' ')
-				wsp = false
+	// Relaxed (RFC 6376 §3.4.4): strip trailing WSP per line, collapse
+	// interior WSP runs to one space, drop trailing empty lines, CRLF line
+	// endings. An empty body canonicalizes to zero bytes. Only SP and HTAB
+	// are whitespace, so a CR that is not part of a line break is an
+	// ordinary octet, as Mail::DKIM reads it. Two readings cover input that
+	// is not in wire form, and match what a DATA writer sends for it: a
+	// lone LF is a line break, and a CR ending the last, unterminated line
+	// is the start of its line break.
+	lines := strings.Split(body, "\n")
+	canonical := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		line = strings.TrimRight(line, " \t")
+		var sb strings.Builder
+		spaceSeen := false
+		// Relaxed canonicalization changes ASCII WSP only. The original
+		// message may contain octets from a non-UTF-8 character set.
+		for i := 0; i < len(line); i++ {
+			b := line[i]
+			if b == ' ' || b == '\t' {
+				if !spaceSeen {
+					sb.WriteByte(' ')
+					spaceSeen = true
+				}
+			} else {
+				sb.WriteByte(b)
+				spaceSeen = false
 			}
-			out = append(out, ch)
 		}
+		canonical = append(canonical, sb.String())
 	}
-	if len(out) > 0 {
-		out = append(out, '\r', '\n')
+	for len(canonical) > 0 && canonical[len(canonical)-1] == "" {
+		canonical = canonical[:len(canonical)-1]
 	}
-	return out
+	var out strings.Builder
+	for _, line := range canonical {
+		out.WriteString(line)
+		out.WriteString("\r\n")
+	}
+	return []byte(out.String())
 }
 
 // removeSignatureValue empties the b= tag's value in a raw signature
@@ -416,16 +520,15 @@ func removeSignatureValue(raw string) string {
 func parsePublicKey(record string) (*rsa.PublicKey, error) {
 	var p string
 	for _, part := range strings.Split(record, ";") {
-		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-		if len(kv) == 2 && kv[0] == "p" {
-			p = kv[1]
+		if name, val, ok := strings.Cut(part, "="); ok && trimFWS(name) == "p" {
+			p = stripFWS(val)
 			break
 		}
 	}
 	if p == "" {
 		return nil, fmt.Errorf("no public key in record")
 	}
-	data, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(p), ""))
+	data, err := base64.StdEncoding.DecodeString(p)
 	if err != nil {
 		return nil, fmt.Errorf("invalid base64 public key: %w", err)
 	}

@@ -23,7 +23,7 @@ var (
 	keyErrs []error
 )
 
-func testKeys(t *testing.T) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) {
+func testKeys(t testing.TB) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) {
 	t.Helper()
 	keyOnce.Do(func() {
 		gen := func() *rsa.PrivateKey {
@@ -41,7 +41,7 @@ func testKeys(t *testing.T) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) 
 	return keyA, keyB, keyC
 }
 
-func txtFor(t *testing.T, key *rsa.PrivateKey) string {
+func txtFor(t testing.TB, key *rsa.PrivateKey) string {
 	t.Helper()
 	pub, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
 	if err != nil {

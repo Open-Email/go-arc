@@ -53,6 +53,9 @@ type SignResult struct {
 	CV ChainStatus
 }
 
+// maxLineLength is the RFC 5322 §2.1.1 limit on a line, CRLF excluded.
+const maxLineLength = 998
+
 // headers the AMS covers when present, in h= order. ARC-* headers are
 // forbidden here (RFC 8617 §4.1.2); Authentication-Results and trace
 // headers are excluded because receivers add their own in transit.
@@ -100,8 +103,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if bits := cfg.PrivateKey.N.BitLen(); bits < 1024 || bits > 4096 {
 		return nil, fmt.Errorf("arc: unsupported RSA key size %d bits (must be 1024–4096)", bits)
 	}
-	if strings.TrimSpace(cfg.AuthResults) == "" {
-		return nil, fmt.Errorf("arc: AuthResults is required — the AAR must carry the results observed at ingress, never fabricated ones")
+	// The results are re-folded clause by clause. CR and LF in them become
+	// spaces, so they can never end the header and start another one.
+	var authResults []string
+	for _, clause := range splitAuthResultsClauses(cfg.AuthResults) {
+		authResults = append(authResults, collapseASCIIWSP(clause))
+	}
+	if authResults[0] == "" {
+		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id — the AAR must carry the results observed at ingress, never fabricated ones")
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -113,6 +122,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	}
 
 	raw := string(outbound)
+	if strings.HasPrefix(raw, " ") || strings.HasPrefix(raw, "\t") {
+		return nil, ErrMalformedMessage
+	}
 	headers, body := splitMessage(raw)
 	if transformed {
 		priorHeaders, _ := splitMessage(string(original))
@@ -161,10 +173,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 
 	// ARC-Authentication-Results: i=N plus the ingress results, re-folded.
 	aarTags := []string{fmt.Sprintf("i=%d", instance)}
-	for _, part := range splitAuthResultsClauses(cfg.AuthResults) {
-		part = collapseASCIIWSP(part)
-		if part != "" {
-			aarTags = append(aarTags, foldAuthResultsClause(part))
+	for _, clause := range authResults {
+		if clause != "" {
+			aarTags = append(aarTags, foldAuthResultsClause(clause))
 		}
 	}
 	aarRaw := foldHeader("ARC-Authentication-Results", aarTags)
@@ -208,7 +219,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, h := range signed {
 		amsHasher.Write([]byte(canonicalizeHeaderRaw(h.raw, canonRelaxed)))
 	}
-	amsHasher.Write([]byte(strings.TrimRight(canonicalizeHeaderRaw(amsUnsigned, canonRelaxed), "\r\n")))
+	amsHasher.Write([]byte(trimLineBreak(canonicalizeHeaderRaw(amsUnsigned, canonRelaxed))))
 	amsSig, err := signHash(cfg.PrivateKey, amsHasher.Sum(nil))
 	if err != nil {
 		return nil, fmt.Errorf("arc: signing ARC-Message-Signature: %w", err)
@@ -249,7 +260,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, h := range sealScope {
 		sealHasher.Write([]byte(canonicalizeHeaderRaw(h, canonRelaxed)))
 	}
-	sealHasher.Write([]byte(strings.TrimRight(canonicalizeHeaderRaw(sealUnsigned, canonRelaxed), "\r\n")))
+	sealHasher.Write([]byte(trimLineBreak(canonicalizeHeaderRaw(sealUnsigned, canonRelaxed))))
 	sealSig, err := signHash(cfg.PrivateKey, sealHasher.Sum(nil))
 	if err != nil {
 		return nil, fmt.Errorf("arc: signing ARC-Seal: %w", err)
@@ -257,6 +268,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	sealRaw, err := spliceSignature(sealUnsigned, sealSig)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, header := range []string{sealRaw, amsRaw, aarRaw} {
+		for _, line := range strings.Split(header, "\r\n") {
+			if len(line) > maxLineLength {
+				return nil, ErrLineTooLong
+			}
+		}
 	}
 
 	logger.Info("ARC set added", "instance", instance, "cv", cv,

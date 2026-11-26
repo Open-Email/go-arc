@@ -394,7 +394,10 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 		return fmt.Errorf("missing d= or s= tag")
 	}
 
-	headerCanon, bodyCanon := parseCanonicalization(tags["c"])
+	headerCanon, bodyCanon, err := parseCanonicalization(tags["c"])
+	if err != nil {
+		return err
+	}
 	if headerName == "ARC-Seal" {
 		// The seal has no c= tag; RFC 8617 fixes it to relaxed.
 		headerCanon, bodyCanon = canonRelaxed, canonRelaxed
@@ -406,7 +409,7 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 		if bh == "" {
 			return fmt.Errorf("missing bh= tag")
 		}
-		want, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(bh), ""))
+		want, err := base64.StdEncoding.DecodeString(stripFWS(bh))
 		if err != nil {
 			return fmt.Errorf("invalid base64 body hash: %w", err)
 		}
@@ -428,14 +431,14 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	// The signature header itself, b= value emptied, no trailing CRLF
 	// (RFC 6376 §3.7).
 	selfCanon := canonicalizeHeaderRaw(removeSignatureValue(sig.raw), headerCanon)
-	hasher.Write([]byte(strings.TrimRight(selfCanon, "\r\n")))
+	hasher.Write([]byte(trimLineBreak(selfCanon)))
 	hashed := hasher.Sum(nil)
 
 	b := tags["b"]
 	if b == "" {
 		return fmt.Errorf("missing b= tag")
 	}
-	signature, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(b), ""))
+	signature, err := base64.StdEncoding.DecodeString(stripFWS(b))
 	if err != nil {
 		return fmt.Errorf("invalid base64 signature: %w", err)
 	}
@@ -483,7 +486,10 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	used := make(map[int]bool)
 	hasFrom := false
 	for _, name := range strings.Split(hTag, ":") {
-		name = asciiLower(strings.TrimSpace(name))
+		name = asciiLower(trimFWS(name))
+		if name == "" {
+			continue // an empty entry names no field
+		}
 		if name == "from" {
 			hasFrom = true
 		}
@@ -503,28 +509,43 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 }
 
 // FindAuthenticationResults returns the value of the topmost
-// Authentication-Results header whose authserv-id matches authservID
-// (case-insensitive), unfolded. This is the input a forwarding sealer
-// needs: the authentication results stamped by its own ADMD's receiving
-// edge.
+// Authentication-Results header whose authserv-id is authservID
+// (ASCII case-insensitive), with each run of whitespace, CR and LF turned
+// into one space. This is the input a forwarding sealer needs: the
+// authentication results stamped by its own ADMD's receiving edge.
+//
+// The match is exact. What stands before the first ";" must be the
+// authserv-id alone, or the authserv-id, whitespace and a version number
+// (RFC 8601 §2.2), once folds are removed. Anything else there, such as a
+// second word or a control or non-ASCII character, makes it another
+// server's header. The caller must still be sure that headers naming its
+// own authserv-id can only come from its own edge (RFC 8601 §5).
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
+	if authservID == "" {
+		return "", false
+	}
 	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
 		if !asciiEqualFold(h.key, "Authentication-Results") {
 			continue
 		}
-		value := collapseASCIIWSP(h.value)
-		id := value
-		if i := strings.IndexByte(id, ';'); i >= 0 {
-			id = id[:i]
+		id, _, _ := strings.Cut(h.value, ";")
+		id, version, hasVersion := strings.Cut(relaxedHeaderValue(id), " ")
+		if !asciiEqualFold(id, authservID) || (hasVersion && !isDigits(version)) {
+			continue
 		}
-		// The authserv-id may carry an optional version token.
-		fields := strings.Fields(strings.TrimSpace(id))
-		if len(fields) > 0 && asciiEqualFold(fields[0], authservID) {
-			return value, true
-		}
+		return collapseASCIIWSP(h.value), true
 	}
 	return "", false
+}
+
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops

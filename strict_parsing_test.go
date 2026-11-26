@@ -639,7 +639,7 @@ func TestSignCoversAbsentAndRepeatedFields(t *testing.T) {
 	}
 	headers, _ := splitMessage(string(sealed.Message))
 	gotH := stripFWS(parseTags(headers[1].value)["h"])
-	const wantH = "from:from:to:to:cc:reply-to:subject:subject:date:date:message-id:message-id:in-reply-to:references:mime-version:content-type:content-transfer-encoding"
+	const wantH = "from:from:sender:to:to:cc:reply-to:subject:subject:date:date:message-id:message-id:in-reply-to:references:mime-version:content-type:content-transfer-encoding:content-disposition"
 	if gotH != wantH {
 		t.Errorf("h= %s\nwant %s", gotH, wantH)
 	}
@@ -651,6 +651,8 @@ func TestSignCoversAbsentAndRepeatedFields(t *testing.T) {
 		"Content-Type and encoding added": head + "\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\n" + body,
 		"transfer encoding added":         head + "\r\ncontent-transfer-encoding: base64\r\n\r\n" + body,
 		"MIME-Version added":              head + "\r\nMIME-Version: 1.0\r\n\r\n" + body,
+		"Content-Disposition added":       "Content-Disposition: attachment; filename=\"invoice.html\"\r\n" + string(sealed.Message),
+		"Sender added":                    head + "\r\nSENDER: mallory@evil.example\r\n\r\n" + body,
 		"second Subject above":            strings.Replace(string(sealed.Message), "Subject: Hello there", "Subject: Pay this invoice\r\nSubject: Hello there", 1),
 		"second Subject below":            strings.Replace(string(sealed.Message), "Subject: Hello there", "Subject: Hello there\r\nSubject: Pay this invoice", 1),
 		"second From above":               strings.Replace(string(sealed.Message), "From: Alice", "From: Mallory <m@evil.example>\r\nFrom: Alice", 1),
@@ -743,10 +745,52 @@ func TestTagAndHeaderListsAreBounded(t *testing.T) {
 	if _, err := selectHeaders("ARC-Message-Signature", "from"+strings.Repeat(":", 1<<20), headers); err == nil {
 		t.Error("selectHeaders accepted a million empty entries")
 	}
+	// The signer stops at the same bound, so what it seals always verifies.
 	key, _, _ := testKeys(t)
-	crowded := strings.Replace(baseMessage, "To: Bob <bob@dest.example>\r\n", strings.Repeat("To: Bob <bob@dest.example>\r\n", maxSignedEntries), 1)
-	if got, err := Sign([]byte(crowded), signConfig(key, "forward-a.example", "sel-a", authResultsA, nil)); !errors.Is(err, ErrMalformedMessage) {
-		t.Errorf("Sign over %d To fields = %v, %v; want ErrMalformedMessage", maxSignedEntries, got, err)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	cfg := signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup)
+	const minimal = "From: a@b.example\r\n"
+	entries := func(msg string) int {
+		sealed, err := Sign([]byte(msg), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		headers, _ := splitMessage(string(sealed.Message))
+		return strings.Count(stripFWS(parseTags(headers[1].value)["h"]), ":") + 1
+	}
+	base := entries(minimal + "\r\nbody\r\n")
+	atBound := minimal + strings.Repeat("To: b@c.example\r\n", maxSignedEntries-base) + "\r\nbody\r\n"
+	sealed, err := Sign([]byte(atBound), cfg)
+	if err != nil || !mustVerify(t, sealed.Message, lookup).Pass {
+		t.Fatalf("Sign with exactly %d h= entries: %v", maxSignedEntries, err)
+	}
+	overBound := minimal + strings.Repeat("To: b@c.example\r\n", maxSignedEntries-base+1) + "\r\nbody\r\n"
+	if got, err := Sign([]byte(overBound), cfg); !errors.Is(err, ErrMalformedMessage) {
+		t.Errorf("Sign with %d h= entries = %v, %v; want ErrMalformedMessage", maxSignedEntries+1, got, err)
+	}
+	// DKIM-Signature entries count as well.
+	withDKIM := func(n int) []byte {
+		return []byte(strings.Repeat("DKIM-Signature: v=1; d=o.example; s=s; h=from; bh=x; b=y\r\n", n) + minimal + "\r\nbody\r\n")
+	}
+	msg := withDKIM(maxSignedEntries - base)
+	sealed, err = SignTransformed(msg, msg, cfg)
+	if err != nil || !mustVerify(t, sealed.Message, lookup).Pass {
+		t.Fatalf("SignTransformed with exactly %d h= entries: %v", maxSignedEntries, err)
+	}
+	msg = withDKIM(maxSignedEntries - base + 1)
+	if got, err := SignTransformed(msg, msg, cfg); !errors.Is(err, ErrMalformedMessage) {
+		t.Errorf("SignTransformed with %d h= entries = %v, %v; want ErrMalformedMessage", maxSignedEntries+1, got, err)
+	}
+
+	// Three fields are added on top, so a message that close to the field
+	// bound is refused rather than sealed into one Verify would not read.
+	full := minimal + strings.Repeat("X-A: 1\r\n", maxHeaderFields-4) + "\r\nbody\r\n"
+	sealed, err = Sign([]byte(full), cfg)
+	if err != nil || !mustVerify(t, sealed.Message, lookup).Pass {
+		t.Fatalf("Sign with %d header fields: %v", maxHeaderFields-3, err)
+	}
+	if got, err := Sign([]byte(minimal+strings.Repeat("X-A: 1\r\n", maxHeaderFields-3)+"\r\nbody\r\n"), cfg); !errors.Is(err, ErrMalformedMessage) {
+		t.Errorf("Sign with %d header fields = %v, %v; want ErrMalformedMessage", maxHeaderFields-2, got, err)
 	}
 }
 
@@ -853,8 +897,18 @@ func TestFindAuthenticationResultsRequiresTheExactAuthservID(t *testing.T) {
 	if got := collapseASCIIWSP(" a\r\nb\rc\nd \t e\r\n"); got != "a b c d e" {
 		t.Errorf("collapseASCIIWSP = %q", got)
 	}
-	// The rest of the header block is Sign's to judge: it refuses the
-	// message and says why, which "no results found" would hide.
+	// Nothing below a line that is not a well-formed header field counts:
+	// it is a header to one parser and not to another.
+	for _, above := range []string{"no colon here", "\r", "X-Old : style", "Subject\f: x", "X-A: a\rb"} {
+		if value, ok := FindAuthenticationResults([]byte(above+"\r\nAuthentication-Results: mx.example.com; dmarc=pass\r\n"+baseMessage), id); ok {
+			t.Errorf("found %q below the line %q", value, above)
+		}
+	}
+	if _, ok := find("Authentication-Results : mx.example.com; dmarc=pass"); ok {
+		t.Error("found a header written with a space before its colon")
+	}
+	// A defect further down is Sign's to judge: it refuses the message and
+	// says why, which "no results found" would hide.
 	malformed := []byte("Authentication-Results: mx.example.com; dmarc=pass\r\nSubject\f: x\r\n" + baseMessage)
 	results, ok := FindAuthenticationResults(malformed, id)
 	if !ok {

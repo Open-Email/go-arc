@@ -61,9 +61,9 @@ const maxLineLength = 998
 // (RFC 8617 §4.1.2); Authentication-Results and trace headers are excluded
 // because receivers add their own in transit.
 var defaultSignedHeaders = []string{
-	"from", "to", "cc", "reply-to", "subject", "date", "message-id",
+	"from", "sender", "to", "cc", "reply-to", "subject", "date", "message-id",
 	"in-reply-to", "references", "mime-version", "content-type",
-	"content-transfer-encoding",
+	"content-transfer-encoding", "content-disposition",
 }
 
 // Sign adds one ARC set to a message per RFC 8617 §5.1.
@@ -137,6 +137,10 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	headers, body, defect := parseMessage(raw)
 	if defect != "" {
 		return nil, fmt.Errorf("%w: %s", ErrMalformedMessage, defect)
+	}
+	if len(headers)+3 > maxHeaderFields {
+		// With the three new fields Verify would refuse the result.
+		return nil, fmt.Errorf("%w: more than %d header fields with the new ARC set", ErrMalformedMessage, maxHeaderFields)
 	}
 	if transformed {
 		priorHeaders, _ := splitMessage(string(original))

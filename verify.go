@@ -547,16 +547,23 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 // authserv-id as a plain token, optionally followed by a version number
 // (any digits), with comments and folding white space allowed around both
 // (RFC 8601 §2.2). A second word, a quoted name, or a control or non-ASCII
-// character next to the name, makes it another server's header. The rest of the header block is not judged here: Sign
-// refuses a message with a malformed one and says why. The caller must still
-// be sure that headers naming its own authserv-id can only come from its own
-// edge (RFC 8601 §5).
+// character next to the name, makes it another server's header.
+//
+// The search stops at the first line that is not a well-formed header
+// field: what stands below it is a header to one parser and not to another.
+// An edge prepends its stamp, so a genuine one is above any such line, and
+// Sign then refuses the message and says why. The caller must still be sure
+// that headers naming its own authserv-id can only come from its own edge
+// (RFC 8601 §5).
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	if authservID == "" {
 		return "", false
 	}
 	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
+		if _, _, defect := parseMessage(h.raw); defect != "" {
+			return "", false
+		}
 		if asciiEqualFold(h.key, "Authentication-Results") && authservIDIs(h.value, authservID) {
 			return collapseASCIIWSP(h.value), true
 		}

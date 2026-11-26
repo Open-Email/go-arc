@@ -134,16 +134,21 @@ func splitMessage(raw string) ([]rawHeader, string) {
 //   - a header field: a name of printable ASCII characters other than ":",
 //     directly followed by ":" (RFC 5322 §2.2);
 //   - a continuation of the field before it: a line that starts with SP or
-//     HTAB and holds something else as well.
+//     HTAB.
 //
 // Anything else is read differently by different software. A line such as
 // "Subject<FF>: x" or "<BOM>Subject: x" is no Subject here, but a mail reader
-// that trims the name shows it as one. A line that holds only CRs, or only
-// white space, or no colon, ends the header block for some parsers and not
-// for others, so one of them shows as the body what another reads as header
-// fields. No reading is safe for all of them. A signature must mean the same
-// message to every reader, so Sign refuses such a message and Verify fails
-// any ARC chain on it.
+// that trims the name shows it as one. A line that holds only CRs, or no
+// colon, or a space before its colon, ends the header block for some parsers
+// and not for others, so one of them shows as the body what another reads as
+// header fields. No reading is safe for all of them. A signature must mean
+// the same header block to every reader, so Sign refuses such a message and
+// Verify fails any ARC chain on it.
+//
+// The body is outside this check. Relaxed body canonicalization (RFC 6376
+// §3.4.4) deliberately lets white space at line ends change, and this
+// package reads a bare LF as a line break, so software that splits MIME
+// parts more strictly can still be shown a part boundary differently.
 //
 // The header block ends at the first empty line (CRLF or LF alone), or at a
 // lone CR that ends the input. Past maxHeaderFields the rest of the input is
@@ -196,12 +201,11 @@ func parseMessage(raw string) (headers []rawHeader, body string, defect string) 
 			note("a CR that is not part of a line break")
 		}
 		if line[0] == ' ' || line[0] == '\t' {
-			// A continuation line extends the current header.
-			switch {
-			case curStart < 0:
+			// A continuation line extends the current header. One that
+			// holds only white space is obsolete syntax that no parser
+			// tried reads differently, and that mail software emits.
+			if curStart < 0 {
 				note("a continuation line with no header field before it")
-			case strings.Trim(content, " \t") == "":
-				note("a continuation line that holds only white space")
 			}
 		} else {
 			flush(pos)
@@ -347,12 +351,17 @@ func parseTags(value string) map[string]string {
 	return tags
 }
 
+// maxTags bounds the tags of one signature header. RFC 8617 and RFC 6376
+// define about a dozen.
+const maxTags = 64
+
 // parseTagList is parseTags, and also reports a tag name that occurs more
-// than once. RFC 6376 §3.2 makes the whole tag-list invalid then: one reader
-// would take the first d= or cv= and another the last.
+// than once, or more than maxTags tags. RFC 6376 §3.2 makes the whole
+// tag-list invalid for a duplicate: one reader would take the first d= or
+// cv= and another the last.
 func parseTagList(value string) (map[string]string, error) {
 	tags := make(map[string]string)
-	var duplicate error
+	var invalid error
 	// The ARC instance clause permits comments containing semicolons
 	// and tag-shaped text. Only the following tag-list contains tags.
 	if n, rest, matched := parseInstanceClause(value); matched {
@@ -362,20 +371,27 @@ func parseTagList(value string) (map[string]string, error) {
 		tags["i"] = strconv.Itoa(n)
 		value = strings.TrimPrefix(rest, ";")
 	}
-	for _, part := range strings.Split(value, ";") {
+	// Walk the list in place: a value made of millions of ";" must not
+	// cost a slice entry each.
+	for more := true; more; {
+		var part string
+		part, value, more = strings.Cut(value, ";")
 		name, val, ok := strings.Cut(part, "=")
 		if !ok {
 			continue
 		}
 		// RFC 6376 §3.2: [FWS] tag-name [FWS] "=" [FWS] tag-value [FWS].
 		if name = trimFWS(name); name != "" {
-			if _, seen := tags[name]; seen && duplicate == nil {
-				duplicate = fmt.Errorf("tag %q occurs more than once", name)
+			if _, seen := tags[name]; seen && invalid == nil {
+				invalid = fmt.Errorf("tag %q occurs more than once", name)
+			}
+			if len(tags) >= maxTags {
+				return tags, fmt.Errorf("more than %d tags", maxTags)
 			}
 			tags[name] = trimFWS(val)
 		}
 	}
-	return tags, duplicate
+	return tags, invalid
 }
 
 type canonicalization string

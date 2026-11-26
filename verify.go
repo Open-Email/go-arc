@@ -408,13 +408,14 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 		return fmt.Errorf("missing d= or s= tag")
 	}
 
-	headerCanon, bodyCanon, err := parseCanonicalization(tags["c"])
-	if err != nil {
-		return err
-	}
-	if headerName == "ARC-Seal" {
-		// The seal has no c= tag; RFC 8617 fixes it to relaxed.
-		headerCanon, bodyCanon = canonRelaxed, canonRelaxed
+	// RFC 8617 §4.1.3 fixes the seal to relaxed header canonicalization.
+	// c= is not one of its tags, so one found there is ignored like any
+	// unknown tag (RFC 6376 §3.2).
+	headerCanon, bodyCanon := canonRelaxed, canonRelaxed
+	if headerName != "ARC-Seal" {
+		if headerCanon, bodyCanon, err = parseCanonicalization(tags["c"]); err != nil {
+			return err
+		}
 	}
 
 	// Body hash — AMS only; the seal covers headers alone.
@@ -485,6 +486,10 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	return nil
 }
 
+// maxSignedEntries bounds the h= list of one signature. Signers list a few
+// dozen names, twice over when they oversign.
+const maxSignedEntries = 1000
+
 // selectHeaders picks the headers a signature covers. The seal's set is
 // supplied by the caller (RFC 8617 fixes it); the AMS follows its h=
 // tag, matching duplicates bottom-up per RFC 6376 §5.4.2 and skipping
@@ -508,7 +513,13 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	}
 	var out []rawHeader
 	hasFrom := false
-	for _, name := range strings.Split(hTag, ":") {
+	entries := 0
+	for more := true; more; {
+		var name string
+		name, hTag, more = strings.Cut(hTag, ":")
+		if entries++; entries > maxSignedEntries {
+			return nil, fmt.Errorf("h= tag lists more than %d fields", maxSignedEntries)
+		}
 		name = asciiLower(trimFWS(name))
 		if name == "from" {
 			hasFrom = true
@@ -533,21 +544,18 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 // authentication results stamped by its own ADMD's receiving edge.
 //
 // The match is exact. What stands before the first ";" must be the
-// authserv-id, optionally followed by a version number, with comments and
-// folding white space allowed around both (RFC 8601 §2.2). A second word, or
-// a control or non-ASCII character next to the name, makes it another
-// server's header. Nothing is found in a message whose header block is
-// malformed (parseMessage), which Sign refuses anyway. The caller must still
+// authserv-id as a plain token, optionally followed by a version number
+// (any digits), with comments and folding white space allowed around both
+// (RFC 8601 §2.2). A second word, a quoted name, or a control or non-ASCII
+// character next to the name, makes it another server's header. The rest of the header block is not judged here: Sign
+// refuses a message with a malformed one and says why. The caller must still
 // be sure that headers naming its own authserv-id can only come from its own
 // edge (RFC 8601 §5).
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	if authservID == "" {
 		return "", false
 	}
-	headers, _, defect := parseMessage(string(rawMessage))
-	if defect != "" {
-		return "", false
-	}
+	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
 		if asciiEqualFold(h.key, "Authentication-Results") && authservIDIs(h.value, authservID) {
 			return collapseASCIIWSP(h.value), true
@@ -580,7 +588,21 @@ func authservIDIs(value, authservID string) bool {
 	if rest, ok = skipCFWS(rest[digits:]); !ok {
 		return false
 	}
-	return rest == "" || rest[0] == ';'
+	if rest != "" && rest[0] != ';' {
+		return false
+	}
+	// skipCFWS takes any CR or LF for white space. Here each must belong to
+	// a fold, so that "id<CR>1" is not read as the id and a version.
+	read := value[:len(value)-len(rest)]
+	for i := 0; i < len(read); i++ {
+		switch {
+		case read[i] == '\r' && (i+1 == len(value) || value[i+1] != '\n'):
+			return false
+		case read[i] == '\n' && i+1 < len(value) && value[i+1] != ' ' && value[i+1] != '\t':
+			return false
+		}
+	}
+	return true
 }
 
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops
@@ -604,6 +626,8 @@ func authResultsPayload(value string) string {
 // previous hop observed) and the wrong one for anybody deciding whether to
 // trust the chain's account of the ORIGINAL sender — use
 // VerifyResult.OldestAuthResults for that, and read its comment for why.
+// It reads the header as written and judges nothing: it also answers for a
+// message whose chain Verify fails, a malformed header block included.
 func LatestARCAuthResults(rawMessage []byte) (int, string, bool) {
 	headers, _ := splitMessage(string(rawMessage))
 	sets, maxInstance, _ := extractARCSets(headers)

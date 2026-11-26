@@ -80,8 +80,9 @@ func TestParseMessageReportsAMalformedHeaderBlock(t *testing.T) {
 		"CR CR LF line ending":             {ok + "Subject: x\r\r\n\r\n", "CR"},
 		"CR inside a value":                {ok + "Subject: a\rb\r\n\r\n", "CR"},
 		"CR inside a continuation":         {ok + "Subject: a\r\n b\rc\r\n\r\n", "CR"},
-		"white-space-only line":            {ok + " \t \r\nSubject: x\r\n\r\n", "white space"},
-		"white-space-only last line":       {ok + "Subject: x\r\n \r\n\r\n", "white space"},
+		"white-space-only continuation":    {ok + " \t \r\nSubject: x\r\n \r\n\r\n", ""},
+		"DEL in the name":                  {ok + "Subject\x7f: x\r\n\r\n", "printable ASCII"},
+		"CR in an unterminated last line":  {ok + "Subject: a\rb", "CR"},
 		"continuation first":               {" orphan\r\n" + ok + "\r\n", "continuation"},
 		"no colon":                         {ok + "xx\r\n\r\n", "not a header field"},
 		"empty name":                       {ok + ": x\r\n\r\n", "not a header field"},
@@ -141,8 +142,6 @@ func TestDecoyLineBreaksTheChain(t *testing.T) {
 			"Subject: Hello there\r\n", "Subject: Hello there\r\n\f- URGENT: pay invoice 4471 today\r\n", 1),
 		"line with no colon, where some parsers start the body": strings.Replace(string(sealed),
 			"From: Alice", "Subject: Pay this invoice\r\nContent-Type: text/html\r\nxx\r\n<p>Wire 5000 EUR.</p><!--\r\nFrom: Alice", 1),
-		"white-space-only line, where some parsers start the body": strings.Replace(string(sealed),
-			"From: Alice", "Subject: Pay this invoice\r\nContent-Type: text/html\r\n \r\n<p>Wire 5000 EUR.</p><!--\r\nFrom: Alice", 1),
 	} {
 		if tampered == string(sealed) {
 			t.Fatalf("%s: nothing was altered", name)
@@ -519,16 +518,18 @@ func TestVerifyRejectsDuplicateTagsAndASealWithH(t *testing.T) {
 		"seal with two cv=":      {sealTags: []string{"cv=none"}},
 		"seal with cv=fail last": {sealTags: []string{"cv=fail"}},
 		"seal with h=":           {sealTags: []string{"h=from"}},
-		"seal with unknown c=":   {sealTags: []string{"c=bogus"}},
+		"seal with an empty h=":  {sealTags: []string{"h="}},
 	} {
 		if res := mustVerify(t, handSeal(t, key, baseMessage, opt), lookup); res.Pass {
 			t.Errorf("%s: the chain verified", name)
 		}
 	}
-	// Tags this package does not know are ignored, once.
+	// Tags this package does not know are ignored, once. c= is not a seal
+	// tag (RFC 8617 §4.1.3), so its value there decides nothing.
 	for name, opt := range map[string]handSealOptions{
 		"AMS with x=":  {amsTags: []string{"x=9999999999", "z=From:a"}},
 		"seal with x=": {sealTags: []string{"x=1"}},
+		"seal with c=": {sealTags: []string{"c=bogus"}},
 	} {
 		if res := mustVerify(t, handSeal(t, key, baseMessage, opt), lookup); !res.Pass {
 			t.Errorf("%s: the chain failed: %v", name, res.FailureReasons)
@@ -607,6 +608,148 @@ func TestHeaderListNamesTrimOnlyFoldingWhitespace(t *testing.T) {
 	}
 }
 
+// A message with a malformed header block and no ARC header passes like any
+// message without a chain: there is nothing to vouch for.
+func TestMalformedMessageWithoutAChainStillPasses(t *testing.T) {
+	for _, msg := range []string{withHeaderLine(baseMessage, "Subject\f: x"), strings.Replace(baseMessage, "\r\n\r\n", "\r\n\r\r\n", 1), " orphan\r\n" + baseMessage} {
+		res := mustVerify(t, []byte(msg), nil)
+		if !res.Pass || !res.ChainValid || res.Instance != 0 || len(res.FailureReasons) != 0 {
+			t.Errorf("Verify(%.30q...) = %+v, want a pass with no chain", msg, res)
+		}
+	}
+}
+
+// The signature lists every default name once per field of that name and
+// once more (RFC 6376 §5.4, §8.15), so no field of such a name can be added
+// after sealing: not a second copy above the signed one, and not one the
+// message never had.
+func TestSignCoversAbsentAndRepeatedFields(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	cfg := signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup)
+	// A plain message: no Reply-To, Cc, Content-Type or transfer encoding.
+	const plain = "From: Alice <alice@origin.example>\r\nTo: Bob <bob@dest.example>\r\nSubject: Hello there\r\n" +
+		"Date: Sat, 01 Aug 2026 12:00:00 +0000\r\nMessage-ID: <abc123@origin.example>\r\n\r\nPGI+UGF5IDUwMDAgRVVSPC9iPg==\r\n"
+	sealed, err := Sign([]byte(plain), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mustVerify(t, sealed.Message, lookup).Pass {
+		t.Fatal("the sealed message does not verify")
+	}
+	headers, _ := splitMessage(string(sealed.Message))
+	gotH := stripFWS(parseTags(headers[1].value)["h"])
+	const wantH = "from:from:to:to:cc:reply-to:subject:subject:date:date:message-id:message-id:in-reply-to:references:mime-version:content-type:content-transfer-encoding"
+	if gotH != wantH {
+		t.Errorf("h= %s\nwant %s", gotH, wantH)
+	}
+	head, body, _ := strings.Cut(string(sealed.Message), "\r\n\r\n")
+	for name, tampered := range map[string]string{
+		"Reply-To added below":            head + "\r\nReply-To: mallory@evil.example\r\n\r\n" + body,
+		"Reply-To added above":            strings.Replace(string(sealed.Message), "From: Alice", "Reply-To: mallory@evil.example\r\nFrom: Alice", 1),
+		"Cc added":                        head + "\r\nCc: mallory@evil.example\r\n\r\n" + body,
+		"Content-Type and encoding added": head + "\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\n" + body,
+		"transfer encoding added":         head + "\r\ncontent-transfer-encoding: base64\r\n\r\n" + body,
+		"MIME-Version added":              head + "\r\nMIME-Version: 1.0\r\n\r\n" + body,
+		"second Subject above":            strings.Replace(string(sealed.Message), "Subject: Hello there", "Subject: Pay this invoice\r\nSubject: Hello there", 1),
+		"second Subject below":            strings.Replace(string(sealed.Message), "Subject: Hello there", "Subject: Hello there\r\nSubject: Pay this invoice", 1),
+		"second From above":               strings.Replace(string(sealed.Message), "From: Alice", "From: Mallory <m@evil.example>\r\nFrom: Alice", 1),
+		"second Date above":               strings.Replace(string(sealed.Message), "Date: Sat", "Date: Sun, 02 Aug 2026 12:00:00 +0000\r\nDate: Sat", 1),
+	} {
+		if tampered == string(sealed.Message) {
+			t.Fatalf("%s: nothing was altered", name)
+		}
+		if mustVerify(t, []byte(tampered), lookup).Pass {
+			t.Errorf("the seal still verifies with %s", name)
+		}
+	}
+	// A field outside the signed names may still be added: that is how
+	// Received and the next hop's own headers arrive.
+	if !mustVerify(t, []byte("Received: from relay.example by mx.example\r\nX-Spam: no\r\n"+string(sealed.Message)), lookup).Pass {
+		t.Error("the seal fails once an unsigned trace field is added")
+	}
+
+	// Fields that repeat at signing time are all covered, bottom up.
+	repeated := strings.Replace(plain, "Subject: Hello there", "Subject: first\r\nSubject: second", 1)
+	sealed, err = Sign([]byte(repeated), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mustVerify(t, sealed.Message, lookup).Pass {
+		t.Fatal("a message with a repeated Subject does not verify after sealing")
+	}
+	for _, edit := range [][2]string{{"Subject: first", "Subject: forged"}, {"Subject: second", "Subject: forged"}, {"Subject: first\r\nSubject: second", "Subject: second\r\nSubject: first"}} {
+		if tampered := bytes.Replace(sealed.Message, []byte(edit[0]), []byte(edit[1]), 1); mustVerify(t, tampered, lookup).Pass {
+			t.Errorf("the seal still verifies with %q changed to %q", edit[0], edit[1])
+		}
+	}
+	// A second hop over the oversigned set extends the chain as usual.
+	_, relayKey, _ := testKeys(t)
+	lookup2 := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key), "sel-b._domainkey.forward-b.example": txtFor(t, relayKey)})
+	second, err := Sign(sealed.Message, signConfig(relayKey, "forward-b.example", "sel-b", authResultsB, lookup2))
+	if err != nil || second.CV != ChainPass || !mustVerify(t, second.Message, lookup2).Pass {
+		t.Fatalf("second hop = %+v, %v", second, err)
+	}
+}
+
+// DKIM-Signature fields are covered as they stand but not oversigned: a later
+// hop adds its own, and that must not break this hop's signature.
+func TestSignTransformedLeavesRoomForALaterDKIMSignature(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	original := []byte("DKIM-Signature: v=1; a=rsa-sha256; d=origin.example; s=s; h=from; bh=x; b=y\r\n" + baseMessage)
+	sealed, err := SignTransformed(original, original, signConfig(key, "forward-a.example", "sel-a", authResultsA, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers, _ := splitMessage(string(sealed.Message))
+	if h := stripFWS(parseTags(headers[1].value)["h"]); strings.Count(h, "dkim-signature") != 1 || !strings.HasSuffix(h, ":dkim-signature") {
+		t.Errorf("h= %s, want one dkim-signature entry at the end", h)
+	}
+	later := append([]byte("DKIM-Signature: v=1; a=rsa-sha256; d=relay.example; s=s; h=from; bh=x; b=y\r\n"), sealed.Message...)
+	if !mustVerify(t, later, lookup).Pass {
+		t.Error("the seal fails once a later hop adds its own DKIM-Signature")
+	}
+	changed := bytes.Replace(sealed.Message, []byte("d=origin.example"), []byte("d=forged.example"), 1)
+	if mustVerify(t, changed, lookup).Pass {
+		t.Error("the seal still verifies with the covered DKIM-Signature changed")
+	}
+}
+
+// A tag list or an h= list far beyond what any signer writes is refused, and
+// reading one made of separators alone costs no memory per separator.
+func TestTagAndHeaderListsAreBounded(t *testing.T) {
+	var many strings.Builder
+	for i := 0; i <= maxTags; i++ {
+		fmt.Fprintf(&many, "t%d=1; ", i)
+	}
+	if _, err := parseTagList(many.String()); err == nil {
+		t.Errorf("parseTagList accepted %d tags", maxTags+1)
+	}
+	if tags, err := parseTagList("a=1" + strings.Repeat(";", 1<<20) + "b=2"); err != nil || tags["a"] != "1" || tags["b"] != "2" {
+		t.Errorf("parseTagList over a run of separators = %v tags, %v", len(tags), err)
+	}
+	value := "a=1" + strings.Repeat(";", 1<<20)
+	if allocs := testing.AllocsPerRun(3, func() { parseTagList(value) }); allocs > 8 {
+		t.Errorf("parseTagList made %.0f allocations for %d separators", allocs, 1<<20)
+	}
+	headers, _ := splitMessage(baseMessage)
+	if _, err := selectHeaders("ARC-Message-Signature", "from"+strings.Repeat(":x", maxSignedEntries-1), headers); err != nil {
+		t.Errorf("selectHeaders refused %d entries: %v", maxSignedEntries, err)
+	}
+	if _, err := selectHeaders("ARC-Message-Signature", "from"+strings.Repeat(":x", maxSignedEntries), headers); err == nil {
+		t.Errorf("selectHeaders accepted %d entries", maxSignedEntries+1)
+	}
+	if _, err := selectHeaders("ARC-Message-Signature", "from"+strings.Repeat(":", 1<<20), headers); err == nil {
+		t.Error("selectHeaders accepted a million empty entries")
+	}
+	key, _, _ := testKeys(t)
+	crowded := strings.Replace(baseMessage, "To: Bob <bob@dest.example>\r\n", strings.Repeat("To: Bob <bob@dest.example>\r\n", maxSignedEntries), 1)
+	if got, err := Sign([]byte(crowded), signConfig(key, "forward-a.example", "sel-a", authResultsA, nil)); !errors.Is(err, ErrMalformedMessage) {
+		t.Errorf("Sign over %d To fields = %v, %v; want ErrMalformedMessage", maxSignedEntries, got, err)
+	}
+}
+
 // Selecting the h= fields used to search the whole header block per entry,
 // before any key was fetched.
 func TestHeaderSelectionTimeIsLinear(t *testing.T) {
@@ -671,8 +814,9 @@ func TestFindAuthenticationResultsRequiresTheExactAuthservID(t *testing.T) {
 		"Authentication-Results: evil.mx.example.com; dmarc=pass",
 		"Authentication-Results: \u00a0mx.example.com; dmarc=pass",
 		"Authentication-Results\u00a0: mx.example.com; dmarc=pass",
-		"Authentication-Results : mx.example.com; dmarc=pass",
 		"\rAuthentication-Results: mx.example.com; dmarc=pass",
+		"Authentication-Results: mx.example.com\r; dmarc=pass",
+		"Authentication-Results: mx.example.com (a\rb); dmarc=pass",
 		"Authentication-Results: ; dmarc=pass",
 	} {
 		if value, ok := find(line); ok {
@@ -709,9 +853,16 @@ func TestFindAuthenticationResultsRequiresTheExactAuthservID(t *testing.T) {
 	if got := collapseASCIIWSP(" a\r\nb\rc\nd \t e\r\n"); got != "a b c d e" {
 		t.Errorf("collapseASCIIWSP = %q", got)
 	}
-	// A malformed header block yields nothing, whatever it holds.
-	if _, ok := FindAuthenticationResults([]byte("Authentication-Results: mx.example.com; dmarc=pass\r\nSubject\f: x\r\n"+baseMessage), id); ok {
-		t.Error("found results in a message with a malformed header block")
+	// The rest of the header block is Sign's to judge: it refuses the
+	// message and says why, which "no results found" would hide.
+	malformed := []byte("Authentication-Results: mx.example.com; dmarc=pass\r\nSubject\f: x\r\n" + baseMessage)
+	results, ok := FindAuthenticationResults(malformed, id)
+	if !ok {
+		t.Fatal("found no results in a message whose defect lies elsewhere")
+	}
+	key, _, _ := testKeys(t)
+	if _, err := Sign(malformed, signConfig(key, "forward-a.example", "sel-a", results, nil)); !errors.Is(err, ErrMalformedMessage) || !strings.Contains(err.Error(), "printable ASCII") {
+		t.Errorf("Sign = %v, want ErrMalformedMessage naming the defect", err)
 	}
 }
 

@@ -56,9 +56,10 @@ type SignResult struct {
 // maxLineLength is the RFC 5322 §2.1.1 limit on a line, CRLF excluded.
 const maxLineLength = 998
 
-// headers the AMS covers when present, in h= order. ARC-* headers are
-// forbidden here (RFC 8617 §4.1.2); Authentication-Results and trace
-// headers are excluded because receivers add their own in transit.
+// headers the AMS covers, in h= order: every field of each name, and the
+// absence of any further one (see sign). ARC-* headers are forbidden here
+// (RFC 8617 §4.1.2); Authentication-Results and trace headers are excluded
+// because receivers add their own in transit.
 var defaultSignedHeaders = []string{
 	"from", "to", "cc", "reply-to", "subject", "date", "message-id",
 	"in-reply-to", "references", "mime-version", "content-type",
@@ -195,22 +196,37 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	// real headers. No v= tag — RFC 8617 defines none.
 	bodyHash := sha256.Sum256(canonicalizeBody(body, canonRelaxed))
 
-	signed := selectSignedHeaders(headers)
+	// Every default name goes into h= once per field of that name, bottom
+	// up, and once more. The extra entry selects nothing now, so a field of
+	// that name added later (a second Subject above the first, a Reply-To
+	// or Content-Type the message never had) is selected by it and breaks
+	// the signature (RFC 6376 §5.4 and §8.15).
+	var signed []rawHeader
+	var hNames []string
+	for _, name := range defaultSignedHeaders {
+		for i := len(headers) - 1; i >= 0; i-- {
+			if asciiEqualFold(headers[i].key, name) {
+				signed = append(signed, headers[i])
+				hNames = append(hNames, name)
+			}
+		}
+		if name == "from" && len(signed) == 0 {
+			return nil, fmt.Errorf("arc: message has no From header")
+		}
+		hNames = append(hNames, name)
+	}
 	if transformed {
 		// RFC 8617 §4.1.2 recommends covering DKIM-Signature fields.
 		// Include every retained occurrence in DKIM verification order.
 		for i := len(headers) - 1; i >= 0; i-- {
 			if asciiEqualFold(headers[i].key, "DKIM-Signature") {
 				signed = append(signed, headers[i])
+				hNames = append(hNames, "dkim-signature")
 			}
 		}
 	}
-	hNames := make([]string, 0, len(signed))
-	for _, h := range signed {
-		hNames = append(hNames, asciiLower(h.key))
-	}
-	if len(hNames) == 0 || hNames[0] != "from" {
-		return nil, fmt.Errorf("arc: message has no From header")
+	if len(hNames) > maxSignedEntries {
+		return nil, fmt.Errorf("%w: more than %d fields to sign", ErrMalformedMessage, maxSignedEntries)
 	}
 
 	amsTags := []string{
@@ -320,25 +336,6 @@ func isDNSName(s string) bool {
 		}
 	}
 	return true
-}
-
-// selectSignedHeaders picks the AMS-covered headers: for each name in
-// defaultSignedHeaders, the bottom-most unused occurrence — the mirror
-// of RFC 6376 §5.4.2 verification order.
-func selectSignedHeaders(headers []rawHeader) []rawHeader {
-	var out []rawHeader
-	used := make(map[int]bool)
-	for _, name := range defaultSignedHeaders {
-		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !asciiEqualFold(headers[i].key, name) {
-				continue
-			}
-			out = append(out, headers[i])
-			used[i] = true
-			break
-		}
-	}
-	return out
 }
 
 func arcHeaderBytes(headers []rawHeader) []string {

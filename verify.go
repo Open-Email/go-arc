@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // VerifyResult reports the outcome of ARC chain validation.
@@ -569,7 +570,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 			return "", false
 		}
 		if asciiEqualFold(h.key, "Authentication-Results") {
-			if _, _, ok := authservIDParts(h.value, authservID); ok {
+			if _, _, ok := authservIDParts(h.value, authservID, false); ok {
 				return collapseASCIIWSP(h.value), true
 			}
 		}
@@ -579,7 +580,8 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 
 // CombinedAuthenticationResults builds one ARC authentication payload from all
 // version 1 Authentication-Results fields stamped by the named service, in
-// wire order (RFC 8617 §4.1.1). A field stating "none" contributes no methods.
+// wire order (RFC 8617 §4.1.1). The service identifier may be a token or a
+// quoted string. A field stating "none" contributes no methods.
 // As with FindAuthenticationResults, the caller must ensure that only its
 // trusted ingress can supply fields naming this service (RFC 8601 §5).
 func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
@@ -602,7 +604,7 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 		if !asciiEqualFold(h.key, "Authentication-Results") {
 			continue
 		}
-		version, rest, ok := authservIDParts(h.value, authservID)
+		version, rest, ok := authservIDParts(h.value, authservID, true)
 		if !ok || rest == "" || version != "" && version != "1" {
 			continue
 		}
@@ -611,7 +613,7 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 			return "", false
 		}
 		for _, clause := range clauses {
-			value := collapseASCIIWSP(clause)
+			value := unfoldAuthenticationResults(clause)
 			if value == "" {
 				return "", false
 			}
@@ -624,7 +626,7 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 			}
 		}
 		if prefix == "" {
-			prefix = collapseASCIIWSP(h.value[:len(h.value)-len(rest)])
+			prefix = unfoldAuthenticationResults(h.value[:len(h.value)-len(rest)])
 		}
 	}
 	if prefix == "" {
@@ -648,19 +650,28 @@ func isNoAuthResult(value string) bool {
 
 // authservIDParts matches [CFWS] authservID [CFWS version] [CFWS] and returns
 // the optional version and the remainder starting at the first real semicolon.
-func authservIDParts(value, authservID string) (version, rest string, ok bool) {
+func authservIDParts(value, authservID string, allowQuoted bool) (version, rest string, ok bool) {
 	rest, ok = skipCFWS(value)
 	if !ok {
 		return "", "", false
 	}
-	end := strings.IndexAny(rest, " \t\r\n;(")
-	if end < 0 {
-		end = len(rest)
+	var id string
+	if allowQuoted && strings.HasPrefix(rest, `"`) {
+		id, rest, ok = quotedAuthservID(rest)
+		if !ok {
+			return "", "", false
+		}
+	} else {
+		end := strings.IndexAny(rest, " \t\r\n;(")
+		if end < 0 {
+			end = len(rest)
+		}
+		id, rest = rest[:end], rest[end:]
 	}
-	if !asciiEqualFold(rest[:end], authservID) {
+	if !asciiEqualFold(id, authservID) {
 		return "", "", false
 	}
-	if rest, ok = skipCFWS(rest[end:]); !ok {
+	if rest, ok = skipCFWS(rest); !ok {
 		return "", "", false
 	}
 	digits := 0
@@ -688,13 +699,50 @@ func authservIDParts(value, authservID string) (version, rest string, ok bool) {
 	return version, rest, true
 }
 
+// quotedAuthservID decodes qtext and quoted-pairs (RFC 5322 §3.2.4).
+// The receiving edge compares a folded continuation after replacing its
+// leading whitespace with one SP. Accept an internal fold only when that
+// yields the same identifier as RFC unfolding.
+func quotedAuthservID(value string) (id, rest string, ok bool) {
+	var result strings.Builder
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		switch c {
+		case '"':
+			id = result.String()
+			return id, value[i+1:], utf8.ValidString(id)
+		case '\\':
+			i++
+			if i == len(value) || (value[i] < ' ' && value[i] != '\t') || value[i] > '~' {
+				return "", "", false
+			}
+			c = value[i]
+		case '\r', '\n':
+			if !strings.HasPrefix(value[i:], "\r\n ") {
+				return "", "", false
+			}
+			i += 2
+			if i+1 < len(value) && (value[i+1] == ' ' || value[i+1] == '\t') {
+				return "", "", false
+			}
+			c = ' '
+		default:
+			if c < ' ' && c != '\t' || c == 0x7f {
+				return "", "", false
+			}
+		}
+		result.WriteByte(c)
+	}
+	return "", "", false
+}
+
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops
 // the leading i= tag, leaving the authserv-id and the results — the shape an
 // ordinary Authentication-Results header has, so the same parser reads both.
 // A value without a recognizable i= tag is returned unfolded and otherwise
 // untouched: reporting it verbatim is more honest than guessing at it.
 func authResultsPayload(value string) string {
-	unfolded := collapseASCIIWSP(value)
+	unfolded := unfoldAuthenticationResults(value)
 	if n, rest, _ := parseInstanceClause(unfolded); n > 0 && strings.HasPrefix(rest, ";") {
 		return strings.Trim(rest[1:], " \t")
 	}

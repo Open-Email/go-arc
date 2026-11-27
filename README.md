@@ -47,6 +47,8 @@ res, err := arc.Sign(rawMessage, &arc.SignConfig{
 
 The signing domain and selector accept internationalized DNS labels such as `bücher.example`. When the outgoing headers already contain UTF-8 text, the signer preserves the configured spelling in `d=` and `s=`. With ASCII headers, it emits the corresponding A-labels, such as `xn--bcher-kva.example`. Verification uses A-labels for DNS key lookups in both cases. [RFC 8617 §4.1.4](https://www.rfc-editor.org/rfc/rfc8617#section-4.1.4)
 
+`CombinedAuthenticationResults` recognizes token and quoted forms of the configured service ID. It preserves spaces and tabs inside quoted results when collecting the fields for sealing. A fold inside a quoted service ID must decode identically at ingress and egress. For the OpenEmail ingress parser, a continuation starting with one space meets that requirement. [RFC 8601 §2.2](https://www.rfc-editor.org/rfc/rfc8601#section-2.2)
+
 Design decisions, all load-bearing:
 
 - **`AuthResults` is required.** Use `CombinedAuthenticationResults` to collect all version 1 assessments from the configured authentication service into one AAR, including when the service stamped separate fields for SPF and DKIM. The receiving edge must remove inbound fields claiming its own authserv-id before stamping its results. Fields from other services are excluded. `FindAuthenticationResults` remains available for callers that need only the topmost matching field. [RFC 8617 §4.1.1](https://www.rfc-editor.org/rfc/rfc8617#section-4.1.1)

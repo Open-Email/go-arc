@@ -111,18 +111,18 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if bits := cfg.PrivateKey.N.BitLen(); bits < 1024 || bits > 4096 {
 		return nil, fmt.Errorf("arc: unsupported RSA key size %d bits (must be 1024–4096)", bits)
 	}
-	// The results are re-folded clause by clause. CR and LF in them become
-	// spaces, so they can never end the header and start another one.
+	// Unfold the results before choosing new fold points. Retain whitespace
+	// inside quoted values and prevent raw line breaks from reaching the AAR.
 	var authResults []string
 	for _, clause := range splitAuthResultsClauses(cfg.AuthResults) {
-		authResults = append(authResults, collapseASCIIWSP(clause))
+		authResults = append(authResults, unfoldAuthenticationResults(clause))
 	}
 	if len(authResults) == 0 || authResults[0] == "" {
 		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id: the AAR must carry the results observed at ingress, never fabricated ones")
 	}
 	for _, clause := range authResults {
 		for i := 0; i < len(clause); i++ {
-			if clause[i] < ' ' || clause[i] == 0x7f {
+			if clause[i] < ' ' && clause[i] != '\t' || clause[i] == 0x7f {
 				return nil, fmt.Errorf("arc: AuthResults holds a control character")
 			}
 		}

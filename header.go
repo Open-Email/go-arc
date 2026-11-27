@@ -450,6 +450,56 @@ func collapseASCIIWSP(s string) string {
 	return sb.String()
 }
 
+// unfoldAuthenticationResults retains quoted-string content and comments.
+// Unfolding removes a line break before WSP, leaving the whitespace itself
+// intact (RFC 5322 §§2.2.3, 3.2.4). Outside those constructs, whitespace
+// separates tokens and can be normalized for the combined AAR.
+func unfoldAuthenticationResults(value string) string {
+	if !strings.ContainsAny(value, "\"(") {
+		return collapseASCIIWSP(value)
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	depth := 0
+	quoted, escaped, pendingSpace := false, false, false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if !quoted && depth == 0 {
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				pendingSpace = out.Len() > 0
+				continue
+			}
+			if pendingSpace {
+				out.WriteByte(' ')
+				pendingSpace = false
+			}
+		} else if c == '\r' || c == '\n' {
+			if c == '\r' && i+1 < len(value) && value[i+1] == '\n' {
+				i++
+			}
+			if i+1 == len(value) || value[i+1] != ' ' && value[i+1] != '\t' {
+				out.WriteByte(' ') // never emit a stray line break
+			}
+			escaped = false
+			continue
+		}
+		out.WriteByte(c)
+		switch {
+		case escaped:
+			escaped = false
+		case c == '\\' && (quoted || depth > 0):
+			escaped = true
+		case c == '"' && depth == 0:
+			quoted = !quoted
+		case c == '(' && !quoted:
+			depth++
+		case c == ')' && depth > 0:
+			depth--
+		}
+	}
+	return out.String()
+}
+
 // relaxedHeaderValue applies RFC 6376 §3.4.2 to a field value, read exactly:
 // the line break of every fold is removed, every run of WSP (SP and HTAB)
 // becomes one SP, and WSP at either end goes. A fold is a line break followed
@@ -702,7 +752,7 @@ func foldHeaderNames(names []string) string {
 }
 
 // foldAuthResultsClause folds a single already-unfolded Authentication-Results
-// clause at unescaped spaces, including those in quotes and comments.
+// clause before unescaped SP or HTAB, including in quotes and comments.
 // RFC 5322 §3.2.1 requires a quoted-pair to stay on the same physical line.
 // Sign checks the 998-byte limit when there is no legal fold point.
 func foldAuthResultsClause(clause string) string {
@@ -714,28 +764,31 @@ func foldAuthResultsClause(clause string) string {
 	sb.Grow(len(clause) + len(clause)/headerFoldWrap*2)
 	lineLen := 2
 	for start := 0; start < len(clause); {
-		end := start
-		for end < len(clause) && clause[end] != ' ' {
+		word := start
+		for word < len(clause) && (clause[word] == ' ' || clause[word] == '\t') {
+			word++
+		}
+		end := word
+		for end < len(clause) && clause[end] != ' ' && clause[end] != '\t' {
 			if clause[end] == '\\' && end+1 < len(clause) {
-				end++ // Keep the quoted-pair together, including an escaped SP.
+				end++ // A quoted-pair, including its WSP, is indivisible.
 			}
 			end++
 		}
-		seg := clause[start:end]
-		switch {
-		case start == 0:
-			sb.WriteString(seg)
-			lineLen += len(seg)
-		case lineLen+1+len(seg)+1 > headerFoldWrap:
-			sb.WriteString("\r\n ")
-			sb.WriteString(seg)
-			lineLen = 1 + len(seg)
-		default:
-			sb.WriteByte(' ')
-			sb.WriteString(seg)
-			lineLen += 1 + len(seg)
+		if word > start && lineLen+end-start+1 > headerFoldWrap {
+			// A whitespace run can take only one fold: a second would
+			// create a WSP-only physical line (RFC 5322 §2.2.3). For a
+			// long run leave enough of it here for the next line to fit.
+			before := max(0, end-start+1-maxLineLength)
+			before = min(before, word-start-1, max(0, maxLineLength-lineLen))
+			sb.WriteString(clause[start : start+before])
+			sb.WriteString("\r\n")
+			start += before
+			lineLen = 0
 		}
-		start = end + 1
+		sb.WriteString(clause[start:end])
+		lineLen += end - start
+		start = end
 	}
 	return sb.String()
 }

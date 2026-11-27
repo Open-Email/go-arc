@@ -862,12 +862,12 @@ func foldHeader(name string, tags []string) string {
 	lineLen := len(name) + 1
 	for i, tag := range tags {
 		chunk := " " + tag
-		if i < len(tags)-1 {
-			chunk += ";"
-		}
+		more := i < len(tags)-1
 		firstLineLen := len(chunk)
 		if nl := strings.Index(chunk, "\r\n"); nl >= 0 {
 			firstLineLen = nl
+		} else if more {
+			firstLineLen++ // reserve space for the following separator
 		}
 		if i > 0 && lineLen+firstLineLen > headerFoldWrap {
 			sb.WriteString("\r\n")
@@ -883,6 +883,16 @@ func foldHeader(name string, tags []string) string {
 			lineLen = len(chunk) - nl - 2
 		} else {
 			lineLen += len(chunk)
+		}
+		if more {
+			if lineLen == maxLineLength {
+				// RFC 8601 §2.2 and RFC 6376 §3.2 allow whitespace
+				// before a separator when the previous line is full.
+				sb.WriteString("\r\n ")
+				lineLen = 1
+			}
+			sb.WriteByte(';')
+			lineLen++
 		}
 	}
 	sb.WriteString("\r\n")

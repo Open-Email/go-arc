@@ -210,6 +210,9 @@ func parseMessage(raw string) (headers []rawHeader, body string, defect error) {
 			// tried reads differently, and that mail software emits.
 			if curStart < 0 {
 				note("a continuation line with no header field before it")
+				// Keep the orphaned lines in wire order. Result lookups stop
+				// at the first defective field, including this one.
+				curStart = pos
 			}
 		} else {
 			flush(pos)
@@ -350,7 +353,7 @@ func skipCFWS(s string) (string, bool) {
 // tag given twice keeps its last value: use parseTagList wherever the value
 // decides something.
 func parseTags(value string) map[string]string {
-	tags, _ := parseTagList(value)
+	tags, _ := parseTagList(value, false)
 	return tags
 }
 
@@ -362,7 +365,7 @@ const maxTags = 64
 // than once, or more than maxTags tags. RFC 6376 §3.2 makes the whole
 // tag-list invalid for a duplicate: one reader would take the first d= or
 // cv= and another the last.
-func parseTagList(value string) (map[string]string, error) {
+func parseTagList(value string, seal bool) (map[string]string, error) {
 	tags := make(map[string]string)
 	var invalid error
 	// The ARC instance clause permits comments containing semicolons
@@ -376,25 +379,54 @@ func parseTagList(value string) (map[string]string, error) {
 	}
 	// Walk the list in place: a value made of millions of ";" must not
 	// cost a slice entry each.
-	for more := true; more; {
-		var part string
-		part, value, more = strings.Cut(value, ";")
-		name, val, ok := strings.Cut(part, "=")
-		if !ok {
+	for value != "" {
+		name, val, rest, err := nextSignatureTag(value, seal)
+		if err != nil {
+			return tags, err
+		}
+		value = strings.TrimPrefix(rest, ";")
+		if name == "" {
 			continue
 		}
-		// RFC 6376 §3.2: [FWS] tag-name [FWS] "=" [FWS] tag-value [FWS].
-		if name = trimFWS(name); name != "" {
-			if _, seen := tags[name]; seen && invalid == nil {
-				invalid = fmt.Errorf("tag %q occurs more than once", name)
-			}
-			if len(tags) >= maxTags {
-				return tags, fmt.Errorf("more than %d tags", maxTags)
-			}
-			tags[name] = trimFWS(val)
+		if _, seen := tags[name]; seen && invalid == nil {
+			invalid = fmt.Errorf("tag %q occurs more than once", name)
 		}
+		if len(tags) >= maxTags {
+			return tags, fmt.Errorf("more than %d tags", maxTags)
+		}
+		tags[name] = trimFWS(val)
 	}
 	return tags, invalid
+}
+
+// nextSignatureTag reads one tag after the instance clause. rest starts at
+// the next semicolon, or is empty. Keep values untrimmed so blanking b=
+// removes exactly its value, including surrounding folding whitespace.
+func nextSignatureTag(input string, seal bool) (name, value, rest string, err error) {
+	if seal {
+		// Only the seal's cv tag permits comments around its equals sign
+		// (RFC 8617 §3.9). Semicolons inside those comments are content.
+		if after, ok := strings.CutPrefix(strings.TrimLeft(input, " \t\r\n"), "cv"); ok {
+			after, valid := skipCFWS(after)
+			if !valid {
+				return "", "", "", errors.New("unterminated comment in cv tag")
+			}
+			if rhs, found := strings.CutPrefix(after, "="); found {
+				input, valid = skipCFWS(rhs)
+				if !valid {
+					return "", "", "", errors.New("unterminated comment in cv tag")
+				}
+				value, _, _ = strings.Cut(input, ";")
+				return "cv", value, input[len(value):], nil
+			}
+		}
+	}
+	tag, _, _ := strings.Cut(input, ";")
+	name, value, ok := strings.Cut(tag, "=")
+	if !ok {
+		name = ""
+	}
+	return trimFWS(name), value, input[len(tag):], nil
 }
 
 type canonicalization string
@@ -633,34 +665,20 @@ func removeSignatureValue(raw string) string {
 		// rest starts at the semicolon after the complete instance clause.
 		i = len(raw) - len(rest) + 1
 	}
+	seal := asciiEqualFold(raw[:colon], "ARC-Seal")
 	for i < len(raw) {
-		// Skip FWS to the start of the next tag.
-		j := i
-		for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\r' || raw[j] == '\n') {
-			j++
-		}
-		if j >= len(raw) {
+		name, value, rest, err := nextSignatureTag(raw[i:], seal)
+		if err != nil {
 			return raw
 		}
-		if raw[j] == 'b' {
-			k := j + 1
-			for k < len(raw) && (raw[k] == ' ' || raw[k] == '\t') {
-				k++
-			}
-			if k < len(raw) && raw[k] == '=' {
-				end := strings.IndexByte(raw[k:], ';')
-				if end < 0 {
-					return raw[:k+1]
-				}
-				return raw[:k+1] + raw[k+end:]
-			}
+		if name == "b" {
+			end := len(raw) - len(rest)
+			return raw[:end-len(value)] + rest
 		}
-		// Not the b= tag: skip this whole tag (values contain no ';').
-		next := strings.IndexByte(raw[j:], ';')
-		if next < 0 {
+		if rest == "" {
 			return raw
 		}
-		i = j + next + 1
+		i = len(raw) - len(rest) + 1
 	}
 	return raw
 }

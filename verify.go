@@ -246,7 +246,7 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 		}
 		inst := InstanceResult{Instance: i}
 		if set.hasSeal {
-			tags := parseTags(set.seal.value)
+			tags, _ := parseTagList(set.seal.value, true)
 			inst.Sealer = tags["d"]
 			inst.ChainStatus = ChainStatus(tags["cv"])
 		}
@@ -280,7 +280,7 @@ func validateChain(headers []rawHeader, body string, sets map[int]*arcSet, maxIn
 	// every later seal must claim pass; a cv=fail anywhere kills the
 	// chain without any cryptography.
 	for i := 1; i <= maxInstance; i++ {
-		tags, err := parseTagList(sets[i].seal.value)
+		tags, err := parseTagList(sets[i].seal.value, true)
 		if err != nil {
 			return false, []string{fmt.Sprintf("ARC-Seal at instance %d: %v", i, err)}
 		}
@@ -391,7 +391,7 @@ func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 // verifySignature verifies one ARC signature header (AMS or AS) over
 // the given headers (and body, for AMS).
 func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body string, lookup LookupTXT) error {
-	tags, err := parseTagList(sig.value)
+	tags, err := parseTagList(sig.value, headerName == "ARC-Seal")
 	if err != nil {
 		return err
 	}

@@ -537,10 +537,10 @@ func TestVerifyRejectsDuplicateTagsAndASealWithH(t *testing.T) {
 			t.Errorf("%s: the chain failed: %v", name, res.FailureReasons)
 		}
 	}
-	if _, err := parseTagList("a=1; b=2; a=3"); err == nil {
+	if _, err := parseTagList("a=1; b=2; a=3", false); err == nil {
 		t.Error("parseTagList accepted a tag given twice")
 	}
-	if tags, err := parseTagList(" (c;i=9) i = 2 ; a=1; b=2"); err != nil || tags["i"] != "2" {
+	if tags, err := parseTagList(" (c;i=9) i = 2 ; a=1; b=2", false); err != nil || tags["i"] != "2" {
 		t.Errorf("parseTagList with an instance clause = %v, %v", tags, err)
 	}
 }
@@ -758,14 +758,14 @@ func TestTagAndHeaderListsAreBounded(t *testing.T) {
 	for i := 0; i <= maxTags; i++ {
 		fmt.Fprintf(&many, "t%d=1; ", i)
 	}
-	if _, err := parseTagList(many.String()); err == nil {
+	if _, err := parseTagList(many.String(), false); err == nil {
 		t.Errorf("parseTagList accepted %d tags", maxTags+1)
 	}
-	if tags, err := parseTagList("a=1" + strings.Repeat(";", 1<<20) + "b=2"); err != nil || tags["a"] != "1" || tags["b"] != "2" {
+	if tags, err := parseTagList("a=1"+strings.Repeat(";", 1<<20)+"b=2", false); err != nil || tags["a"] != "1" || tags["b"] != "2" {
 		t.Errorf("parseTagList over a run of separators = %v tags, %v", len(tags), err)
 	}
 	value := "a=1" + strings.Repeat(";", 1<<20)
-	if allocs := testing.AllocsPerRun(3, func() { parseTagList(value) }); allocs > 8 {
+	if allocs := testing.AllocsPerRun(3, func() { parseTagList(value, false) }); allocs > 8 {
 		t.Errorf("parseTagList made %.0f allocations for %d separators", allocs, 1<<20)
 	}
 	headers, _ := splitMessage(baseMessage)

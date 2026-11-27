@@ -53,6 +53,21 @@ var ErrARCHeadersChanged = errors.New("arc: transformation changed the existing 
 // could not be validated on the original message.
 var ErrPriorChainFailed = errors.New("arc: prior chain did not validate on the original message")
 
+// ErrLineTooLong is returned by Sign and SignTransformed when a header they
+// would add cannot be folded to lines of at most 998 bytes (RFC 5322 §2.1.1),
+// for example because AuthResults holds a longer run without a space.
+var ErrLineTooLong = errors.New("arc: a new ARC header line would exceed 998 bytes")
+
+// ErrMalformedMessage is returned by Sign and SignTransformed when the
+// header block of the message holds a line that is neither a header field
+// (a printable ASCII name directly followed by a colon) nor the continuation
+// of one, a CR outside a line break, or more than 10,000 fields. Mail
+// software disagrees on how to read such a block, so a seal over it would
+// not mean the same message to every reader. The caller should forward the
+// message without adding an ARC set. Verify fails an existing chain for the same
+// reason and fails an incomplete header scan regardless of the ARC headers found.
+var ErrMalformedMessage = errors.New("arc: the header block of the message is malformed")
+
 // ChainStatus is the cv= value of an ARC-Seal.
 type ChainStatus string
 

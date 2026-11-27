@@ -12,6 +12,9 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 )
 
 // SignConfig configures Sign.
@@ -28,7 +31,7 @@ type SignConfig struct {
 	// "mx.example.com; spf=pass smtp.mailfrom=a@b; dkim=pass header.d=b".
 	// It becomes the AAR. Required: a sealer that did not observe the
 	// message's arrival has nothing truthful to seal.
-	// FindAuthenticationResults extracts it from an edge-stamped header.
+	// CombinedAuthenticationResults collects it from the edge-stamped fields.
 	AuthResults string
 	// LookupTXT fetches public keys for validating an existing chain
 	// (the cv= determination). Required when the message already
@@ -53,13 +56,17 @@ type SignResult struct {
 	CV ChainStatus
 }
 
-// headers the AMS covers when present, in h= order. ARC-* headers are
-// forbidden here (RFC 8617 §4.1.2); Authentication-Results and trace
-// headers are excluded because receivers add their own in transit.
+// maxLineLength is the RFC 5322 §2.1.1 limit on a line, CRLF excluded.
+const maxLineLength = 998
+
+// headers the AMS covers, in h= order: every field of each name, and the
+// absence of any further one (see sign). ARC-* headers are forbidden here
+// (RFC 8617 §4.1.2); Authentication-Results and trace headers are excluded
+// because receivers add their own in transit.
 var defaultSignedHeaders = []string{
-	"from", "to", "cc", "reply-to", "subject", "date", "message-id",
+	"from", "sender", "to", "cc", "reply-to", "subject", "date", "message-id",
 	"in-reply-to", "references", "mime-version", "content-type",
-	"content-transfer-encoding",
+	"content-transfer-encoding", "content-disposition",
 }
 
 // Sign adds one ARC set to a message per RFC 8617 §5.1.
@@ -82,7 +89,7 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 // and the final outbound bytes after every change, including local DKIM signing.
 // The outbound message must preserve all ARC-* headers and their order byte for
 // byte. If a prior chain exists, it must validate on the original. A message
-// without prior ARC gets a first-hop seal.
+// without prior ARC gets a first-hop seal if the original header scan completed.
 func SignTransformed(original, outbound []byte, cfg *SignConfig) (*SignResult, error) {
 	return sign(original, outbound, cfg, true)
 }
@@ -94,14 +101,34 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if cfg.Domain == "" || cfg.Selector == "" {
 		return nil, fmt.Errorf("arc: Domain and Selector are required")
 	}
+	domain, selector, err := keyDNSNames(cfg.Domain, cfg.Selector)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.PrivateKey == nil {
 		return nil, fmt.Errorf("arc: PrivateKey is required")
 	}
 	if bits := cfg.PrivateKey.N.BitLen(); bits < 1024 || bits > 4096 {
 		return nil, fmt.Errorf("arc: unsupported RSA key size %d bits (must be 1024–4096)", bits)
 	}
-	if strings.TrimSpace(cfg.AuthResults) == "" {
-		return nil, fmt.Errorf("arc: AuthResults is required — the AAR must carry the results observed at ingress, never fabricated ones")
+	// Unfold the results before choosing new fold points. Retain whitespace
+	// inside quoted values and prevent raw line breaks from reaching the AAR.
+	var authResults []string
+	if len(cfg.AuthResults) > maxAuthResultsBytes {
+		return nil, fmt.Errorf("arc: AuthResults exceeds %d bytes", maxAuthResultsBytes)
+	}
+	for _, clause := range splitAuthResultsClauses(cfg.AuthResults) {
+		authResults = append(authResults, unfoldAuthenticationResults(clause))
+	}
+	if len(authResults) == 0 || authResults[0] == "" {
+		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id: the AAR must carry the results observed at ingress, never fabricated ones")
+	}
+	for _, clause := range authResults {
+		for i := 0; i < len(clause); i++ {
+			if clause[i] < ' ' && clause[i] != '\t' || clause[i] == 0x7f {
+				return nil, fmt.Errorf("arc: AuthResults holds a control character")
+			}
+		}
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -113,9 +140,23 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	}
 
 	raw := string(outbound)
-	headers, body := splitMessage(raw)
+	headers, body, defect := parseMessage(raw)
+	if defect != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, defect)
+	}
+	// d= and s= always carry the A-labels. U-labels are permitted in an
+	// internationalized message (RFC 8616 §4), but a verifier that does not
+	// convert them looks up a name that holds no key, and A-labels are
+	// valid everywhere.
+	if len(headers)+3 > maxHeaderFields {
+		// With the three new fields Verify would refuse the result.
+		return nil, fmt.Errorf("%w: more than %d header fields with the new ARC set", ErrMalformedMessage, maxHeaderFields)
+	}
 	if transformed {
-		priorHeaders, _ := splitMessage(string(original))
+		priorHeaders, _, priorDefect := parseMessage(string(original))
+		if priorDefect == errHeaderFieldLimit {
+			return nil, fmt.Errorf("%w: original has %v", ErrMalformedMessage, priorDefect)
+		}
 		if !slices.Equal(arcHeaderBytes(priorHeaders), arcHeaderBytes(headers)) {
 			return nil, ErrARCHeadersChanged
 		}
@@ -161,10 +202,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 
 	// ARC-Authentication-Results: i=N plus the ingress results, re-folded.
 	aarTags := []string{fmt.Sprintf("i=%d", instance)}
-	for _, part := range strings.Split(cfg.AuthResults, ";") {
-		part = collapseASCIIWSP(part)
-		if part != "" {
-			aarTags = append(aarTags, foldAuthResultsClause(part))
+	for _, clause := range authResults {
+		if clause != "" {
+			aarTags = append(aarTags, foldAuthResultsClause(clause))
 		}
 	}
 	aarRaw := foldHeader("ARC-Authentication-Results", aarTags)
@@ -173,30 +213,45 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	// real headers. No v= tag — RFC 8617 defines none.
 	bodyHash := sha256.Sum256(canonicalizeBody(body, canonRelaxed))
 
-	signed := selectSignedHeaders(headers)
+	// Every default name goes into h= once per field of that name, bottom
+	// up, and once more. The extra entry selects nothing now, so a field of
+	// that name added later (a second Subject above the first, a Reply-To
+	// or Content-Type the message never had) is selected by it and breaks
+	// the signature (RFC 6376 §5.4 and §8.15).
+	var signed []rawHeader
+	var hNames []string
+	for _, name := range defaultSignedHeaders {
+		for i := len(headers) - 1; i >= 0; i-- {
+			if asciiEqualFold(headers[i].key, name) {
+				signed = append(signed, headers[i])
+				hNames = append(hNames, name)
+			}
+		}
+		if name == "from" && len(signed) == 0 {
+			return nil, fmt.Errorf("arc: message has no From header")
+		}
+		hNames = append(hNames, name)
+	}
 	if transformed {
 		// RFC 8617 §4.1.2 recommends covering DKIM-Signature fields.
 		// Include every retained occurrence in DKIM verification order.
 		for i := len(headers) - 1; i >= 0; i-- {
-			if strings.EqualFold(headers[i].key, "DKIM-Signature") {
+			if asciiEqualFold(headers[i].key, "DKIM-Signature") {
 				signed = append(signed, headers[i])
+				hNames = append(hNames, "dkim-signature")
 			}
 		}
 	}
-	hNames := make([]string, 0, len(signed))
-	for _, h := range signed {
-		hNames = append(hNames, strings.ToLower(h.key))
-	}
-	if len(hNames) == 0 || hNames[0] != "from" {
-		return nil, fmt.Errorf("arc: message has no From header")
+	if len(hNames) > maxSignedEntries {
+		return nil, fmt.Errorf("%w: more than %d fields to sign", ErrMalformedMessage, maxSignedEntries)
 	}
 
 	amsTags := []string{
 		fmt.Sprintf("i=%d", instance),
 		"a=rsa-sha256",
 		"c=relaxed/relaxed",
-		"d=" + cfg.Domain,
-		"s=" + cfg.Selector,
+		"d=" + domain,
+		"s=" + selector,
 		fmt.Sprintf("t=%d", timestamp),
 		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
 		"h=" + foldHeaderNames(hNames),
@@ -208,7 +263,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, h := range signed {
 		amsHasher.Write([]byte(canonicalizeHeaderRaw(h.raw, canonRelaxed)))
 	}
-	amsHasher.Write([]byte(strings.TrimRight(canonicalizeHeaderRaw(amsUnsigned, canonRelaxed), "\r\n")))
+	amsHasher.Write([]byte(trimLineBreak(canonicalizeHeaderRaw(amsUnsigned, canonRelaxed))))
 	amsSig, err := signHash(cfg.PrivateKey, amsHasher.Sum(nil))
 	if err != nil {
 		return nil, fmt.Errorf("arc: signing ARC-Message-Signature: %w", err)
@@ -224,8 +279,8 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		"a=rsa-sha256",
 		fmt.Sprintf("t=%d", timestamp),
 		"cv=" + string(cv),
-		"d=" + cfg.Domain,
-		"s=" + cfg.Selector,
+		"d=" + domain,
+		"s=" + selector,
 		"b=",
 	}
 	sealUnsigned := foldHeader("ARC-Seal", sealTags)
@@ -249,7 +304,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, h := range sealScope {
 		sealHasher.Write([]byte(canonicalizeHeaderRaw(h, canonRelaxed)))
 	}
-	sealHasher.Write([]byte(strings.TrimRight(canonicalizeHeaderRaw(sealUnsigned, canonRelaxed), "\r\n")))
+	sealHasher.Write([]byte(trimLineBreak(canonicalizeHeaderRaw(sealUnsigned, canonRelaxed))))
 	sealSig, err := signHash(cfg.PrivateKey, sealHasher.Sum(nil))
 	if err != nil {
 		return nil, fmt.Errorf("arc: signing ARC-Seal: %w", err)
@@ -257,6 +312,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	sealRaw, err := spliceSignature(sealUnsigned, sealSig)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, header := range []string{sealRaw, amsRaw, aarRaw} {
+		for _, line := range strings.Split(header, "\r\n") {
+			if len(line) > maxLineLength {
+				return nil, ErrLineTooLong
+			}
+		}
 	}
 
 	logger.Info("ARC set added", "instance", instance, "cv", cv,
@@ -272,23 +335,76 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	return &SignResult{Message: []byte(out.String()), Instance: instance, CV: cv}, nil
 }
 
-// selectSignedHeaders picks the AMS-covered headers: for each name in
-// defaultSignedHeaders, the bottom-most unused occurrence — the mirror
-// of RFC 6376 §5.4.2 verification order.
-func selectSignedHeaders(headers []rawHeader) []rawHeader {
-	var out []rawHeader
-	used := make(map[int]bool)
-	for _, name := range defaultSignedHeaders {
-		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !strings.EqualFold(headers[i].key, name) {
-				continue
-			}
-			out = append(out, headers[i])
-			used[i] = true
-			break
+// maxAuthResultsBytes bounds the results one ARC set records. An edge's
+// stamp is a few hundred bytes; the bound keeps a hostile field from costing
+// memory many times its size.
+const maxAuthResultsBytes = 64 << 10
+
+// keyDNSNames validates the signing identities and returns their DNS form.
+// The resolver requires A-labels even when the signed fields use U-labels.
+func keyDNSNames(domain, selector string) (string, string, error) {
+	d, validDomain := asciiDNSName(domain, false)
+	s, validSelector := asciiDNSName(selector, true)
+	if !validDomain || !strings.Contains(d, ".") || !validSelector || len(s)+len("._domainkey.")+len(d) > 253 {
+		return "", "", fmt.Errorf("arc: Domain and Selector must form a valid DNS key name")
+	}
+	return d, s, nil
+}
+
+func hasNonASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return true
 		}
 	}
-	return out
+	return false
+}
+
+func asciiDNSName(name string, selector bool) (string, bool) {
+	if name == "" || len(name) > 253*utf8.UTFMax {
+		return "", false
+	}
+	international := hasNonASCII(name)
+	var labels []string
+	for label := range strings.SplitSeq(name, ".") {
+		if !hasNonASCII(label) {
+			if !validASCIIKeyLabel(label, selector) {
+				return "", false
+			}
+			if international {
+				label = asciiLower(label)
+			}
+		}
+		if international {
+			labels = append(labels, label)
+		}
+	}
+	if !international {
+		return name, len(name) <= 253
+	}
+	// Registration validates U-labels without mapping invalid spellings.
+	ascii, err := idna.Registration.ToASCII(strings.Join(labels, "."))
+	return ascii, err == nil && len(ascii) <= 253
+}
+
+// Signing domains use the host-label grammar from RFC 6376 §3.5. Keep the
+// existing support for underscore selectors used by some installations.
+func validASCIIKeyLabel(label string, selector bool) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := asciiLowerByte(label[i])
+		if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || selector && c == '_') {
+			return false
+		}
+	}
+	if len(label) >= 4 && asciiEqualFold(label[:4], "xn--") {
+		lower := asciiLower(label)
+		canonical, err := idna.Registration.ToASCII(lower)
+		return err == nil && canonical == lower
+	}
+	return true
 }
 
 func arcHeaderBytes(headers []rawHeader) []string {

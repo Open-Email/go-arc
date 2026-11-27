@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // VerifyResult reports the outcome of ARC chain validation.
@@ -113,12 +114,13 @@ type arcSet struct {
 
 // Verify validates the ARC chain of a message per RFC 8617 §5.2.
 //
-// A message with no ARC headers passes (there is nothing to validate).
-// A message with ARC headers passes only if every instance from 1 to N
-// is complete, every cv= value is semantically correct (none at i=1,
-// pass above), the newest (i=N) ARC-Message-Signature verifies
-// cryptographically, and every ARC-Seal from 1 to N verifies
-// cryptographically.
+// A message with no ARC headers passes if the complete header block was scanned.
+// A message with ARC headers passes only if its header block is well
+// formed (parseMessage: a line that mail readers may read differently
+// fails the chain), every instance from 1 to N is complete, every cv=
+// value is semantically correct (none at i=1, pass above), the newest
+// (i=N) ARC-Message-Signature verifies cryptographically, and every
+// ARC-Seal from 1 to N verifies cryptographically.
 func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 	if opts == nil {
 		opts = &VerifyOptions{}
@@ -132,11 +134,10 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		lookup = DefaultLookupTXT
 	}
 
-	raw := string(rawMessage)
-	headers, _ := splitMessage(raw)
+	headers, body, defect := parseMessage(string(rawMessage))
 	sets, maxInstance, problems := extractARCSets(headers)
 
-	if maxInstance == 0 && len(sets) == 0 && len(problems) == 0 {
+	if defect != errHeaderFieldLimit && maxInstance == 0 && len(sets) == 0 && len(problems) == 0 {
 		logger.Debug("no ARC headers found")
 		return &VerifyResult{Pass: true, ChainValid: true, Instance: 0}, nil
 	}
@@ -151,11 +152,14 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		return result, nil
 	}
 	result.Instances = collectInstances(sets, maxInstance)
+	if defect != nil {
+		result.FailureReasons = append(result.FailureReasons, "malformed header block: "+defect.Error())
+	}
 	if len(result.FailureReasons) > 0 {
 		return result, nil
 	}
 
-	valid, reasons := validateChain(raw, headers, sets, maxInstance, lookup, logger)
+	valid, reasons := validateChain(headers, body, sets, maxInstance, lookup, logger)
 	result.ChainValid = valid
 	result.Pass = valid
 	result.FailureReasons = append(result.FailureReasons, reasons...)
@@ -187,11 +191,11 @@ func extractARCSets(headers []rawHeader) (map[int]*arcSet, int, []string) {
 	for _, h := range headers {
 		var kind string
 		switch {
-		case strings.EqualFold(h.key, "ARC-Authentication-Results"):
+		case asciiEqualFold(h.key, "ARC-Authentication-Results"):
 			kind = "aar"
-		case strings.EqualFold(h.key, "ARC-Message-Signature"):
+		case asciiEqualFold(h.key, "ARC-Message-Signature"):
 			kind = "ams"
-		case strings.EqualFold(h.key, "ARC-Seal"):
+		case asciiEqualFold(h.key, "ARC-Seal"):
 			kind = "seal"
 		default:
 			continue
@@ -242,7 +246,7 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 		}
 		inst := InstanceResult{Instance: i}
 		if set.hasSeal {
-			tags := parseTags(set.seal.value)
+			tags, _ := parseTagList(set.seal.value, true)
 			inst.Sealer = tags["d"]
 			inst.ChainStatus = ChainStatus(tags["cv"])
 		}
@@ -260,7 +264,7 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 // validateChain checks completeness, cv= semantics, the newest AMS
 // (RFC 8617 §5.2 Step 2), and every AS signature from oldest to newest
 // (RFC 8617 §5.2 Step 3).
-func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxInstance int, lookup LookupTXT, logger *slog.Logger) (bool, []string) {
+func validateChain(headers []rawHeader, body string, sets map[int]*arcSet, maxInstance int, lookup LookupTXT, logger *slog.Logger) (bool, []string) {
 	// Completeness: every instance 1..N with all three headers.
 	for i := 1; i <= maxInstance; i++ {
 		set := sets[i]
@@ -276,7 +280,11 @@ func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxIns
 	// every later seal must claim pass; a cv=fail anywhere kills the
 	// chain without any cryptography.
 	for i := 1; i <= maxInstance; i++ {
-		cv := ChainStatus(parseTags(sets[i].seal.value)["cv"])
+		tags, err := parseTagList(sets[i].seal.value, true)
+		if err != nil {
+			return false, []string{fmt.Sprintf("ARC-Seal at instance %d: %v", i, err)}
+		}
+		cv := ChainStatus(tags["cv"])
 		switch {
 		case i == 1 && cv != ChainNone:
 			return false, []string{fmt.Sprintf("ARC-Seal at instance 1 must have cv=none, found %q", cv)}
@@ -287,7 +295,6 @@ func validateChain(raw string, headers []rawHeader, sets map[int]*arcSet, maxIns
 		}
 	}
 
-	_, body := splitMessage(raw)
 	if err := verifyMessageSignature(headers, body, maxInstance, lookup); err != nil {
 		reason := fmt.Sprintf("ARC-Message-Signature verification failed at instance %d: %v", maxInstance, err)
 		logger.Debug(reason)
@@ -337,7 +344,7 @@ func verifySeal(headers []rawHeader, instance int, lookup LookupTXT) error {
 
 func findARCHeader(headers []rawHeader, name string, instance int) (rawHeader, bool) {
 	for _, h := range headers {
-		if strings.EqualFold(h.key, name) && h.instance == instance {
+		if asciiEqualFold(h.key, name) && h.instance == instance {
 			return h, true
 		}
 	}
@@ -357,16 +364,16 @@ func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 		if h.instance <= 0 || h.instance > maxInstance {
 			continue
 		}
-		if h.instance == maxInstance && strings.EqualFold(h.key, "ARC-Seal") {
+		if h.instance == maxInstance && asciiEqualFold(h.key, "ARC-Seal") {
 			continue
 		}
 		out = append(out, h)
 	}
 	typeOrder := func(key string) int {
 		switch {
-		case strings.EqualFold(key, "ARC-Authentication-Results"):
+		case asciiEqualFold(key, "ARC-Authentication-Results"):
 			return 1
-		case strings.EqualFold(key, "ARC-Message-Signature"):
+		case asciiEqualFold(key, "ARC-Message-Signature"):
 			return 2
 		default:
 			return 3
@@ -384,7 +391,15 @@ func arcHeadersUpTo(headers []rawHeader, maxInstance int) []rawHeader {
 // verifySignature verifies one ARC signature header (AMS or AS) over
 // the given headers (and body, for AMS).
 func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body string, lookup LookupTXT) error {
-	tags := parseTags(sig.value)
+	tags, err := parseTagList(sig.value, headerName == "ARC-Seal")
+	if err != nil {
+		return err
+	}
+	if _, has := tags["h"]; has && headerName == "ARC-Seal" {
+		// RFC 8617 §4.1.3: the h tag is not allowed in a seal, and one
+		// that carries it must fail.
+		return fmt.Errorf("ARC-Seal carries an h= tag")
+	}
 
 	if a := tags["a"]; a != "rsa-sha256" {
 		return fmt.Errorf("unsupported algorithm %q", a)
@@ -393,11 +408,18 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	if domain == "" || selector == "" {
 		return fmt.Errorf("missing d= or s= tag")
 	}
+	if domain, selector, err = verifyKeyDNSNames(domain, selector); err != nil {
+		return err
+	}
 
-	headerCanon, bodyCanon := parseCanonicalization(tags["c"])
-	if headerName == "ARC-Seal" {
-		// The seal has no c= tag; RFC 8617 fixes it to relaxed.
-		headerCanon, bodyCanon = canonRelaxed, canonRelaxed
+	// RFC 8617 §4.1.3 fixes the seal to relaxed header canonicalization.
+	// c= is not one of its tags, so one found there is ignored like any
+	// unknown tag (RFC 6376 §3.2).
+	headerCanon, bodyCanon := canonRelaxed, canonRelaxed
+	if headerName != "ARC-Seal" {
+		if headerCanon, bodyCanon, err = parseCanonicalization(tags["c"]); err != nil {
+			return err
+		}
 	}
 
 	// Body hash — AMS only; the seal covers headers alone.
@@ -406,7 +428,7 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 		if bh == "" {
 			return fmt.Errorf("missing bh= tag")
 		}
-		want, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(bh), ""))
+		want, err := base64.StdEncoding.DecodeString(stripFWS(bh))
 		if err != nil {
 			return fmt.Errorf("invalid base64 body hash: %w", err)
 		}
@@ -428,14 +450,14 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	// The signature header itself, b= value emptied, no trailing CRLF
 	// (RFC 6376 §3.7).
 	selfCanon := canonicalizeHeaderRaw(removeSignatureValue(sig.raw), headerCanon)
-	hasher.Write([]byte(strings.TrimRight(selfCanon, "\r\n")))
+	hasher.Write([]byte(trimLineBreak(selfCanon)))
 	hashed := hasher.Sum(nil)
 
 	b := tags["b"]
 	if b == "" {
 		return fmt.Errorf("missing b= tag")
 	}
-	signature, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(b), ""))
+	signature, err := base64.StdEncoding.DecodeString(stripFWS(b))
 	if err != nil {
 		return fmt.Errorf("invalid base64 signature: %w", err)
 	}
@@ -468,6 +490,10 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	return nil
 }
 
+// maxSignedEntries bounds the h= list of one signature. Signers list a few
+// dozen names, twice over when they oversign.
+const maxSignedEntries = 1000
+
 // selectHeaders picks the headers a signature covers. The seal's set is
 // supplied by the caller (RFC 8617 fixes it); the AMS follows its h=
 // tag, matching duplicates bottom-up per RFC 6376 §5.4.2 and skipping
@@ -479,21 +505,34 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	if hTag == "" {
 		return nil, fmt.Errorf("missing h= tag")
 	}
+	// Index the fields by name once, top to bottom, so each h= entry takes
+	// the bottom-most one left in constant time. Searching the whole block
+	// per entry was quadratic in a message built for it.
+	byName := make(map[string][]int)
+	for i, h := range headers {
+		if h.key != "" {
+			name := asciiLower(h.key)
+			byName[name] = append(byName[name], i)
+		}
+	}
 	var out []rawHeader
-	used := make(map[int]bool)
 	hasFrom := false
-	for _, name := range strings.Split(hTag, ":") {
-		name = strings.ToLower(strings.TrimSpace(name))
+	entries := 0
+	for more := true; more; {
+		var name string
+		name, hTag, more = strings.Cut(hTag, ":")
+		if entries++; entries > maxSignedEntries {
+			return nil, fmt.Errorf("h= tag lists more than %d fields", maxSignedEntries)
+		}
+		name = asciiLower(trimFWS(name))
 		if name == "from" {
 			hasFrom = true
 		}
-		for i := len(headers) - 1; i >= 0; i-- {
-			if used[i] || !strings.EqualFold(headers[i].key, name) {
-				continue
-			}
-			out = append(out, headers[i])
-			used[i] = true
-			break
+		// An empty entry names no field, and a name with none left selects
+		// nothing (RFC 6376 §5.4.2).
+		if left := byName[name]; name != "" && len(left) > 0 {
+			out = append(out, headers[left[len(left)-1]])
+			byName[name] = left[:len(left)-1]
 		}
 	}
 	if !hasFrom {
@@ -502,29 +541,245 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	return out, nil
 }
 
+// verifyKeyDNSNames returns the DNS names to look a signer's key up under.
+// U-labels are converted to A-labels (RFC 8616 §4). An ASCII name is used
+// as written, as other verifiers do, as long as DNS can hold it: Sign's
+// stricter host-name grammar would fail seals made by others with names
+// such as "mail_relay.example" or "localhost".
+func verifyKeyDNSNames(domain, selector string) (string, string, error) {
+	if hasNonASCII(domain) || hasNonASCII(selector) {
+		d, s, err := keyDNSNames(domain, selector)
+		if err != nil {
+			return "", "", fmt.Errorf("d= and s= do not form a DNS name for the key: %q, %q", domain, selector)
+		}
+		return d, s, nil
+	}
+	if !dnsHoldable(domain) || !dnsHoldable(selector) || len(selector)+len("._domainkey.")+len(domain) > 253 {
+		return "", "", fmt.Errorf("d= and s= do not form a DNS name for the key: %q, %q", domain, selector)
+	}
+	return domain, selector, nil
+}
+
+// dnsHoldable reports whether an ASCII name is dot-separated labels of 1 to
+// 63 printable characters.
+func dnsHoldable(name string) bool {
+	for label := range strings.SplitSeq(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			if label[i] <= ' ' || label[i] > '~' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // FindAuthenticationResults returns the value of the topmost
-// Authentication-Results header whose authserv-id matches authservID
-// (case-insensitive), unfolded. This is the input a forwarding sealer
-// needs: the authentication results stamped by its own ADMD's receiving
-// edge.
+// Authentication-Results header whose authserv-id is authservID
+// (ASCII case-insensitive), with each run of whitespace, CR and LF turned
+// into one space. Forwarding sealers can use CombinedAuthenticationResults
+// to collect the service's assessments across multiple fields.
+//
+// The match is exact. What stands before the first ";" must be the
+// authserv-id as a plain token, optionally followed by a version number
+// (any digits), with comments and folding white space allowed around both
+// (RFC 8601 §2.2). A second word, a quoted name, or a control or non-ASCII
+// character next to the name, makes it another server's header.
+//
+// The search stops at the first line that is not a well-formed header
+// field: what stands below it is a header to one parser and not to another.
+// An edge prepends its stamp, so a genuine one is above any such line, and
+// Sign then refuses the message and says why. The caller must still be sure
+// that headers naming its own authserv-id can only come from its own edge
+// (RFC 8601 §5).
 func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
+	if authservID == "" {
+		return "", false
+	}
 	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
-		if !strings.EqualFold(h.key, "Authentication-Results") {
-			continue
+		if _, _, defect := parseMessage(h.raw); defect != nil {
+			return "", false
 		}
-		value := collapseASCIIWSP(h.value)
-		id := value
-		if i := strings.IndexByte(id, ';'); i >= 0 {
-			id = id[:i]
-		}
-		// The authserv-id may carry an optional version token.
-		fields := strings.Fields(strings.TrimSpace(id))
-		if len(fields) > 0 && strings.EqualFold(fields[0], authservID) {
-			return value, true
+		if asciiEqualFold(h.key, "Authentication-Results") {
+			if _, _, ok := authservIDParts(h.value, authservID, false); ok {
+				return collapseASCIIWSP(h.value), true
+			}
 		}
 	}
 	return "", false
+}
+
+// CombinedAuthenticationResults builds one ARC authentication payload from all
+// version 1 Authentication-Results fields stamped by the named service, in
+// wire order (RFC 8617 §4.1.1). The service identifier may be a token or a
+// quoted string. A field stating "none" contributes no methods.
+// As with FindAuthenticationResults, the caller must ensure that only its
+// trusted ingress can supply fields naming this service (RFC 8601 §5): every
+// such field is combined, wherever it stands.
+//
+// It reports nothing (false) rather than guess when the service's results
+// cannot be read whole: a field with an unbalanced comment or quoted string,
+// an empty result such as a trailing ";", "none" beside other results in one
+// field, results over 64 KiB in all, or a header block of more than 10,000
+// fields. Like FindAuthenticationResults it stops at the first line that is
+// not a well-formed header field, and fields of other versions are skipped.
+func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
+	if authservID == "" {
+		return "", false
+	}
+	headers, _, defect := parseMessage(string(rawMessage))
+	if defect == errHeaderFieldLimit {
+		return "", false
+	}
+	var prefix string
+	var results []string
+	size := 0
+	for _, h := range headers {
+		if defect != nil {
+			// As in the topmost lookup, trust only the unambiguous prefix.
+			if _, _, err := parseMessage(h.raw); err != nil {
+				break
+			}
+		}
+		if !asciiEqualFold(h.key, "Authentication-Results") {
+			continue
+		}
+		version, rest, ok := authservIDParts(h.value, authservID, true)
+		if !ok || rest == "" || version != "" && version != "1" {
+			continue
+		}
+		if size += len(rest); size > maxAuthResultsBytes {
+			return "", false
+		}
+		clauses := splitAuthResultsClauses(rest[1:])
+		if clauses == nil {
+			return "", false
+		}
+		for _, clause := range clauses {
+			value := unfoldAuthenticationResults(clause)
+			if value == "" {
+				return "", false
+			}
+			if isNoAuthResult(value) {
+				if len(clauses) != 1 {
+					return "", false
+				}
+			} else {
+				results = append(results, value)
+			}
+		}
+		if prefix == "" {
+			prefix = unfoldAuthenticationResults(h.value[:len(h.value)-len(rest)])
+		}
+	}
+	if prefix == "" {
+		return "", false
+	}
+	if len(results) == 0 {
+		return prefix + "; none", true
+	}
+	return prefix + "; " + strings.Join(results, "; "), true
+}
+
+// The no-result production permits CFWS on both sides of "none".
+func isNoAuthResult(value string) bool {
+	rest, ok := skipCFWS(value)
+	if !ok || len(rest) < 4 || !asciiEqualFold(rest[:4], "none") {
+		return false
+	}
+	rest, ok = skipCFWS(rest[4:])
+	return ok && rest == ""
+}
+
+// authservIDParts matches [CFWS] authservID [CFWS version] [CFWS] and returns
+// the optional version and the remainder starting at the first real semicolon.
+func authservIDParts(value, authservID string, allowQuoted bool) (version, rest string, ok bool) {
+	rest, ok = skipCFWS(value)
+	if !ok {
+		return "", "", false
+	}
+	var id string
+	if allowQuoted && strings.HasPrefix(rest, `"`) {
+		id, rest, ok = quotedAuthservID(rest)
+		if !ok {
+			return "", "", false
+		}
+	} else {
+		end := strings.IndexAny(rest, " \t\r\n;(")
+		if end < 0 {
+			end = len(rest)
+		}
+		id, rest = rest[:end], rest[end:]
+	}
+	if !asciiEqualFold(id, authservID) {
+		return "", "", false
+	}
+	if rest, ok = skipCFWS(rest); !ok {
+		return "", "", false
+	}
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	version = rest[:digits]
+	if rest, ok = skipCFWS(rest[digits:]); !ok {
+		return "", "", false
+	}
+	if rest != "" && rest[0] != ';' {
+		return "", "", false
+	}
+	// skipCFWS takes any CR or LF for white space. Here each must belong to
+	// a fold, so that "id<CR>1" is not read as the id and a version.
+	read := value[:len(value)-len(rest)]
+	for i := 0; i < len(read); i++ {
+		switch {
+		case read[i] == '\r' && (i+1 == len(value) || value[i+1] != '\n'):
+			return "", "", false
+		case read[i] == '\n' && i+1 < len(value) && value[i+1] != ' ' && value[i+1] != '\t':
+			return "", "", false
+		}
+	}
+	return version, rest, true
+}
+
+// quotedAuthservID decodes qtext and quoted-pairs (RFC 5322 §3.2.4).
+// The receiving edge compares a folded continuation after replacing its
+// leading whitespace with one SP. Accept an internal fold only when that
+// yields the same identifier as RFC unfolding.
+func quotedAuthservID(value string) (id, rest string, ok bool) {
+	var result strings.Builder
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		switch c {
+		case '"':
+			id = result.String()
+			return id, value[i+1:], utf8.ValidString(id)
+		case '\\':
+			i++
+			if i == len(value) || (value[i] < ' ' && value[i] != '\t') || value[i] > '~' {
+				return "", "", false
+			}
+			c = value[i]
+		case '\r', '\n':
+			if !strings.HasPrefix(value[i:], "\r\n ") {
+				return "", "", false
+			}
+			i += 2
+			if i+1 < len(value) && (value[i+1] == ' ' || value[i+1] == '\t') {
+				return "", "", false
+			}
+			c = ' '
+		default:
+			if c < ' ' && c != '\t' || c == 0x7f {
+				return "", "", false
+			}
+		}
+		result.WriteByte(c)
+	}
+	return "", "", false
 }
 
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops
@@ -533,7 +788,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 // A value without a recognizable i= tag is returned unfolded and otherwise
 // untouched: reporting it verbatim is more honest than guessing at it.
 func authResultsPayload(value string) string {
-	unfolded := collapseASCIIWSP(value)
+	unfolded := unfoldAuthenticationResults(value)
 	if n, rest, _ := parseInstanceClause(unfolded); n > 0 && strings.HasPrefix(rest, ";") {
 		return strings.Trim(rest[1:], " \t")
 	}
@@ -548,6 +803,8 @@ func authResultsPayload(value string) string {
 // previous hop observed) and the wrong one for anybody deciding whether to
 // trust the chain's account of the ORIGINAL sender — use
 // VerifyResult.OldestAuthResults for that, and read its comment for why.
+// It reads the header as written and judges nothing: it also answers for a
+// message whose chain Verify fails, a malformed header block included.
 func LatestARCAuthResults(rawMessage []byte) (int, string, bool) {
 	headers, _ := splitMessage(string(rawMessage))
 	sets, maxInstance, _ := extractARCSets(headers)

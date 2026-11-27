@@ -23,7 +23,7 @@ var (
 	keyErrs []error
 )
 
-func testKeys(t *testing.T) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) {
+func testKeys(t testing.TB) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) {
 	t.Helper()
 	keyOnce.Do(func() {
 		gen := func() *rsa.PrivateKey {
@@ -41,7 +41,7 @@ func testKeys(t *testing.T) (*rsa.PrivateKey, *rsa.PrivateKey, *rsa.PrivateKey) 
 	return keyA, keyB, keyC
 }
 
-func txtFor(t *testing.T, key *rsa.PrivateKey) string {
+func txtFor(t testing.TB, key *rsa.PrivateKey) string {
 	t.Helper()
 	pub, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
 	if err != nil {
@@ -956,4 +956,23 @@ func TestSignRefusesWithoutFromHeader(t *testing.T) {
 	if _, err := Sign([]byte(noFrom), cfg); err == nil {
 		t.Fatal("Sign accepted a message without a From header")
 	}
+}
+
+// selectSignedHeaders picks, for each name in defaultSignedHeaders, the
+// bottom-most field of that name: what a signer covers that lists each name
+// once. Tests use it to build such signatures by hand.
+func selectSignedHeaders(headers []rawHeader) []rawHeader {
+	var out []rawHeader
+	used := make(map[int]bool)
+	for _, name := range defaultSignedHeaders {
+		for i := len(headers) - 1; i >= 0; i-- {
+			if used[i] || !asciiEqualFold(headers[i].key, name) {
+				continue
+			}
+			out = append(out, headers[i])
+			used[i] = true
+			break
+		}
+	}
+	return out
 }

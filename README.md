@@ -1,6 +1,6 @@
 # go-arc
 
-ARC (Authenticated Received Chain, [RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) signing and verification for Go. Pure stdlib — no dependencies.
+ARC (Authenticated Received Chain, [RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) signing and verification for Go.
 
 ARC preserves email authentication results across forwarding hops. Each intermediary adds one **ARC set** — `ARC-Authentication-Results` (what its receiving edge observed), `ARC-Message-Signature` (a DKIM-style signature over the message), and `ARC-Seal` (a signature over *every* ARC header of every instance so far, making the chain tamper-evident).
 
@@ -44,6 +44,8 @@ res, err := arc.Sign(rawMessage, &arc.SignConfig{
 })
 // res.Message has the new ARC set prepended; res.Instance, res.CV
 ```
+
+The signing domain and selector accept internationalized DNS labels such as `bücher.example`. When the outgoing headers already contain UTF-8 text, the signer preserves the configured spelling in `d=` and `s=`. With ASCII headers, it emits the corresponding A-labels, such as `xn--bcher-kva.example`. Verification uses A-labels for DNS key lookups in both cases. [RFC 8617 §4.1.4](https://www.rfc-editor.org/rfc/rfc8617#section-4.1.4)
 
 Design decisions, all load-bearing:
 

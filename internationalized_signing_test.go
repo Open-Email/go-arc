@@ -30,8 +30,8 @@ func TestInternationalizedSigningIdentity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			headers, _ := splitMessage(string(first.Message))
 			for _, name := range []string{"ARC-Message-Signature", "ARC-Seal"} {
-				headers, _ := splitMessage(string(first.Message))
 				field, ok := findARCHeader(headers, name, 1)
 				tags := parseTags(field.value)
 				if !ok || tags["d"] != tc.wantDomain || tags["s"] != tc.wantSelector {
@@ -41,7 +41,7 @@ func TestInternationalizedSigningIdentity(t *testing.T) {
 			if verified := mustVerify(t, first.Message, lookup); !verified.Pass {
 				t.Fatalf("ARC verification with A-label DNS records failed: %v", verified.FailureReasons)
 			}
-			outbound := bytes.Replace(first.Message, []byte("Bonjour."), []byte("Bonjour de Paris."), 1)
+			outbound := append(bytes.Clone(first.Message), []byte("Forwarded.\r\n")...)
 			second, err := SignTransformed(first.Message, outbound, signConfig(relay, "relay.example", "next", "relay.example; arc=pass", lookup))
 			if err != nil {
 				t.Fatal(err)

@@ -12,6 +12,9 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 )
 
 // SignConfig configures Sign.
@@ -98,9 +101,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if cfg.Domain == "" || cfg.Selector == "" {
 		return nil, fmt.Errorf("arc: Domain and Selector are required")
 	}
-	// Both go into the new headers as written and into the key's DNS name.
-	if !isDNSName(cfg.Domain) || !isDNSName(cfg.Selector) {
-		return nil, fmt.Errorf("arc: Domain and Selector must be DNS names")
+	domain, selector, err := keyDNSNames(cfg.Domain, cfg.Selector)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.PrivateKey == nil {
 		return nil, fmt.Errorf("arc: PrivateKey is required")
@@ -137,6 +140,14 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	headers, body, defect := parseMessage(raw)
 	if defect != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, defect)
+	}
+	if domain != cfg.Domain || selector != cfg.Selector {
+		// RFC 8617 §4.1.4 permits U-labels in internationalized headers.
+		// Use A-labels when the outbound headers still fit ASCII.
+		headerBlock := raw[:len(raw)-len(body)]
+		if hasNonASCII(headerBlock) && utf8.ValidString(headerBlock) {
+			domain, selector = cfg.Domain, cfg.Selector
+		}
 	}
 	if len(headers)+3 > maxHeaderFields {
 		// With the three new fields Verify would refuse the result.
@@ -240,8 +251,8 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		fmt.Sprintf("i=%d", instance),
 		"a=rsa-sha256",
 		"c=relaxed/relaxed",
-		"d=" + cfg.Domain,
-		"s=" + cfg.Selector,
+		"d=" + domain,
+		"s=" + selector,
 		fmt.Sprintf("t=%d", timestamp),
 		"bh=" + base64.StdEncoding.EncodeToString(bodyHash[:]),
 		"h=" + foldHeaderNames(hNames),
@@ -269,8 +280,8 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 		"a=rsa-sha256",
 		fmt.Sprintf("t=%d", timestamp),
 		"cv=" + string(cv),
-		"d=" + cfg.Domain,
-		"s=" + cfg.Selector,
+		"d=" + domain,
+		"s=" + selector,
 		"b=",
 	}
 	sealUnsigned := foldHeader("ARC-Seal", sealTags)
@@ -323,6 +334,45 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	out.WriteString(raw)
 
 	return &SignResult{Message: []byte(out.String()), Instance: instance, CV: cv}, nil
+}
+
+// keyDNSNames validates the signing identities and returns their DNS form.
+// The resolver requires A-labels even when the signed fields use U-labels.
+func keyDNSNames(domain, selector string) (string, string, error) {
+	d, validDomain := asciiDNSName(domain)
+	s, validSelector := asciiDNSName(selector)
+	if !validDomain || !validSelector || len(s)+len("._domainkey.")+len(d) > 253 {
+		return "", "", fmt.Errorf("arc: Domain and Selector must form a valid DNS key name")
+	}
+	return d, s, nil
+}
+
+func hasNonASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return true
+		}
+	}
+	return false
+}
+
+func asciiDNSName(name string) (string, bool) {
+	if len(name) > 253*utf8.UTFMax {
+		return "", false
+	}
+	if !hasNonASCII(name) {
+		return name, isDNSName(name)
+	}
+	// Validate U-labels without mapping invalid spellings. Ordinary ASCII
+	// labels elsewhere in the same name are case-insensitive.
+	labels := strings.Split(name, ".")
+	for i, label := range labels {
+		if !hasNonASCII(label) {
+			labels[i] = asciiLower(label)
+		}
+	}
+	ascii, err := idna.Registration.ToASCII(strings.Join(labels, "."))
+	return ascii, err == nil && isDNSName(ascii)
 }
 
 // isDNSName reports whether s is made of dot-separated labels of letters,

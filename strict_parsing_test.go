@@ -1038,7 +1038,7 @@ func TestSignValidatesWhatItWritesIntoHeaders(t *testing.T) {
 	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
 	for _, bad := range []string{
 		"forward-a.example\r\nX-Injected: yes", "a b.example", "a;b=c", "a..example", ".example", "example.",
-		"b\u00fccher.example", strings.Repeat("a", 64) + ".example", strings.Repeat("a.", 127) + "a", "a\x00.example",
+		"\u200dbücher.example", strings.Repeat("a", 64) + ".example", strings.Repeat("a.", 127) + "a", "a\x00.example",
 	} {
 		if got, err := Sign([]byte(baseMessage), signConfig(key, bad, "sel-a", authResultsA, lookup)); err == nil {
 			t.Errorf("Sign accepted Domain %q: %q", bad, firstLine(got.Message, "ARC-Seal"))

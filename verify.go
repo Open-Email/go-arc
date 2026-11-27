@@ -407,6 +407,10 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	if domain == "" || selector == "" {
 		return fmt.Errorf("missing d= or s= tag")
 	}
+	domain, selector, err = keyDNSNames(domain, selector)
+	if err != nil {
+		return err
+	}
 
 	// RFC 8617 §4.1.3 fixes the seal to relaxed header canonicalization.
 	// c= is not one of its tags, so one found there is ignored like any

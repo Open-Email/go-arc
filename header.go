@@ -702,12 +702,9 @@ func foldHeaderNames(names []string) string {
 }
 
 // foldAuthResultsClause folds a single already-unfolded Authentication-Results
-// clause at ASCII SP boundaries so that a line exceeds headerFoldWrap bytes
-// only when one run without a space is longer than that (Sign then checks
-// RFC 5322's 998-byte limit). Every SP in the clause may be folded, including
-// those inside quoted strings and comments:
-// RFC 5322 §3.2.2 and §3.2.4 permit FWS there, and unfolding removes only
-// the inserted CRLF, so the value reads back unchanged.
+// clause at unescaped spaces, including those in quotes and comments.
+// RFC 5322 §3.2.1 requires a quoted-pair to stay on the same physical line.
+// Sign checks the 998-byte limit when there is no legal fold point.
 func foldAuthResultsClause(clause string) string {
 	// Account for a continuation prefix ("\t " = 2 bytes) and trailing ";".
 	if 2+len(clause)+1 <= headerFoldWrap {
@@ -716,9 +713,17 @@ func foldAuthResultsClause(clause string) string {
 	var sb strings.Builder
 	sb.Grow(len(clause) + len(clause)/headerFoldWrap*2)
 	lineLen := 2
-	for i, seg := range strings.Split(clause, " ") {
+	for start := 0; start < len(clause); {
+		end := start
+		for end < len(clause) && clause[end] != ' ' {
+			if clause[end] == '\\' && end+1 < len(clause) {
+				end++ // Keep the quoted-pair together, including an escaped SP.
+			}
+			end++
+		}
+		seg := clause[start:end]
 		switch {
-		case i == 0:
+		case start == 0:
 			sb.WriteString(seg)
 			lineLen += len(seg)
 		case lineLen+1+len(seg)+1 > headerFoldWrap:
@@ -730,6 +735,7 @@ func foldAuthResultsClause(clause string) string {
 			sb.WriteString(seg)
 			lineLen += 1 + len(seg)
 		}
+		start = end + 1
 	}
 	return sb.String()
 }

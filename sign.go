@@ -31,7 +31,7 @@ type SignConfig struct {
 	// "mx.example.com; spf=pass smtp.mailfrom=a@b; dkim=pass header.d=b".
 	// It becomes the AAR. Required: a sealer that did not observe the
 	// message's arrival has nothing truthful to seal.
-	// FindAuthenticationResults extracts it from an edge-stamped header.
+	// CombinedAuthenticationResults collects it from the edge-stamped fields.
 	AuthResults string
 	// LookupTXT fetches public keys for validating an existing chain
 	// (the cv= determination). Required when the message already
@@ -117,7 +117,7 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	for _, clause := range splitAuthResultsClauses(cfg.AuthResults) {
 		authResults = append(authResults, collapseASCIIWSP(clause))
 	}
-	if authResults[0] == "" {
+	if len(authResults) == 0 || authResults[0] == "" {
 		return nil, fmt.Errorf("arc: AuthResults is required and must begin with the authserv-id: the AAR must carry the results observed at ingress, never fabricated ones")
 	}
 	for _, clause := range authResults {
@@ -339,9 +339,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 // keyDNSNames validates the signing identities and returns their DNS form.
 // The resolver requires A-labels even when the signed fields use U-labels.
 func keyDNSNames(domain, selector string) (string, string, error) {
-	d, validDomain := asciiDNSName(domain)
-	s, validSelector := asciiDNSName(selector)
-	if !validDomain || !validSelector || len(s)+len("._domainkey.")+len(d) > 253 {
+	d, validDomain := asciiDNSName(domain, false)
+	s, validSelector := asciiDNSName(selector, true)
+	if !validDomain || !strings.Contains(d, ".") || !validSelector || len(s)+len("._domainkey.")+len(d) > 253 {
 		return "", "", fmt.Errorf("arc: Domain and Selector must form a valid DNS key name")
 	}
 	return d, s, nil
@@ -356,41 +356,49 @@ func hasNonASCII(s string) bool {
 	return false
 }
 
-func asciiDNSName(name string) (string, bool) {
-	if len(name) > 253*utf8.UTFMax {
+func asciiDNSName(name string, selector bool) (string, bool) {
+	if name == "" || len(name) > 253*utf8.UTFMax {
 		return "", false
 	}
-	if !hasNonASCII(name) {
-		return name, isDNSName(name)
-	}
-	// Validate U-labels without mapping invalid spellings. Ordinary ASCII
-	// labels elsewhere in the same name are case-insensitive.
-	labels := strings.Split(name, ".")
-	for i, label := range labels {
+	international := hasNonASCII(name)
+	var labels []string
+	for label := range strings.SplitSeq(name, ".") {
 		if !hasNonASCII(label) {
-			labels[i] = asciiLower(label)
-		}
-	}
-	ascii, err := idna.Registration.ToASCII(strings.Join(labels, "."))
-	return ascii, err == nil && isDNSName(ascii)
-}
-
-// isDNSName reports whether s is made of dot-separated labels of letters,
-// digits, "-" and "_", at most 253 bytes in all.
-func isDNSName(s string) bool {
-	if s == "" || len(s) > 253 {
-		return false
-	}
-	for _, label := range strings.Split(s, ".") {
-		if label == "" || len(label) > 63 {
-			return false
-		}
-		for i := 0; i < len(label); i++ {
-			c := label[i]
-			if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
-				return false
+			if !validASCIIKeyLabel(label, selector) {
+				return "", false
+			}
+			if international {
+				label = asciiLower(label)
 			}
 		}
+		if international {
+			labels = append(labels, label)
+		}
+	}
+	if !international {
+		return name, len(name) <= 253
+	}
+	// Registration validates U-labels without mapping invalid spellings.
+	ascii, err := idna.Registration.ToASCII(strings.Join(labels, "."))
+	return ascii, err == nil && len(ascii) <= 253
+}
+
+// Signing domains use the host-label grammar from RFC 6376 §3.5. Keep the
+// existing support for underscore selectors used by some installations.
+func validASCIIKeyLabel(label string, selector bool) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := asciiLowerByte(label[i])
+		if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || selector && c == '_') {
+			return false
+		}
+	}
+	if len(label) >= 4 && asciiEqualFold(label[:4], "xn--") {
+		lower := asciiLower(label)
+		canonical, err := idna.Registration.ToASCII(lower)
+		return err == nil && canonical == lower
 	}
 	return true
 }

@@ -544,8 +544,8 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 // FindAuthenticationResults returns the value of the topmost
 // Authentication-Results header whose authserv-id is authservID
 // (ASCII case-insensitive), with each run of whitespace, CR and LF turned
-// into one space. This is the input a forwarding sealer needs: the
-// authentication results stamped by its own ADMD's receiving edge.
+// into one space. Forwarding sealers can use CombinedAuthenticationResults
+// to collect the service's assessments across multiple fields.
 //
 // The match is exact. What stands before the first ";" must be the
 // authserv-id as a plain token, optionally followed by a version number
@@ -568,39 +568,111 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 		if _, _, defect := parseMessage(h.raw); defect != nil {
 			return "", false
 		}
-		if asciiEqualFold(h.key, "Authentication-Results") && authservIDIs(h.value, authservID) {
-			return collapseASCIIWSP(h.value), true
+		if asciiEqualFold(h.key, "Authentication-Results") {
+			if _, _, ok := authservIDParts(h.value, authservID); ok {
+				return collapseASCIIWSP(h.value), true
+			}
 		}
 	}
 	return "", false
 }
 
-// authservIDIs reports whether an Authentication-Results value opens with
-// [CFWS] authservID [CFWS version] [CFWS] and then ends or reaches ";".
-func authservIDIs(value, authservID string) bool {
+// CombinedAuthenticationResults builds one ARC authentication payload from all
+// version 1 Authentication-Results fields stamped by the named service, in
+// wire order (RFC 8617 §4.1.1). A field stating "none" contributes no methods.
+// As with FindAuthenticationResults, the caller must ensure that only its
+// trusted ingress can supply fields naming this service (RFC 8601 §5).
+func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
+	if authservID == "" {
+		return "", false
+	}
+	headers, _, defect := parseMessage(string(rawMessage))
+	if defect == errHeaderFieldLimit {
+		return "", false
+	}
+	var prefix string
+	var results []string
+	for _, h := range headers {
+		if defect != nil {
+			// As in the topmost lookup, trust only the unambiguous prefix.
+			if _, _, err := parseMessage(h.raw); err != nil {
+				break
+			}
+		}
+		if !asciiEqualFold(h.key, "Authentication-Results") {
+			continue
+		}
+		version, rest, ok := authservIDParts(h.value, authservID)
+		if !ok || rest == "" || version != "" && version != "1" {
+			continue
+		}
+		clauses := splitAuthResultsClauses(rest[1:])
+		if clauses == nil {
+			return "", false
+		}
+		for _, clause := range clauses {
+			value := collapseASCIIWSP(clause)
+			if value == "" {
+				return "", false
+			}
+			if isNoAuthResult(value) {
+				if len(clauses) != 1 {
+					return "", false
+				}
+			} else {
+				results = append(results, value)
+			}
+		}
+		if prefix == "" {
+			prefix = collapseASCIIWSP(h.value[:len(h.value)-len(rest)])
+		}
+	}
+	if prefix == "" {
+		return "", false
+	}
+	if len(results) == 0 {
+		return prefix + "; none", true
+	}
+	return prefix + "; " + strings.Join(results, "; "), true
+}
+
+// The no-result production permits CFWS on both sides of "none".
+func isNoAuthResult(value string) bool {
 	rest, ok := skipCFWS(value)
-	if !ok {
+	if !ok || len(rest) < 4 || !asciiEqualFold(rest[:4], "none") {
 		return false
+	}
+	rest, ok = skipCFWS(rest[4:])
+	return ok && rest == ""
+}
+
+// authservIDParts matches [CFWS] authservID [CFWS version] [CFWS] and returns
+// the optional version and the remainder starting at the first real semicolon.
+func authservIDParts(value, authservID string) (version, rest string, ok bool) {
+	rest, ok = skipCFWS(value)
+	if !ok {
+		return "", "", false
 	}
 	end := strings.IndexAny(rest, " \t\r\n;(")
 	if end < 0 {
 		end = len(rest)
 	}
 	if !asciiEqualFold(rest[:end], authservID) {
-		return false
+		return "", "", false
 	}
 	if rest, ok = skipCFWS(rest[end:]); !ok {
-		return false
+		return "", "", false
 	}
 	digits := 0
 	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
 		digits++
 	}
+	version = rest[:digits]
 	if rest, ok = skipCFWS(rest[digits:]); !ok {
-		return false
+		return "", "", false
 	}
 	if rest != "" && rest[0] != ';' {
-		return false
+		return "", "", false
 	}
 	// skipCFWS takes any CR or LF for white space. Here each must belong to
 	// a fold, so that "id<CR>1" is not read as the id and a version.
@@ -608,12 +680,12 @@ func authservIDIs(value, authservID string) bool {
 	for i := 0; i < len(read); i++ {
 		switch {
 		case read[i] == '\r' && (i+1 == len(value) || value[i+1] != '\n'):
-			return false
+			return "", "", false
 		case read[i] == '\n' && i+1 < len(value) && value[i+1] != ' ' && value[i+1] != '\t':
-			return false
+			return "", "", false
 		}
 	}
-	return true
+	return version, rest, true
 }
 
 // authResultsPayload unfolds an ARC-Authentication-Results value and drops

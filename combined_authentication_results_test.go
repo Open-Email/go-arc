@@ -17,6 +17,9 @@ func TestCombinedAuthenticationResults(t *testing.T) {
 		{"separate assessments in wire order", []string{first, "other.example; dmarc=pass", edge + "; " + dkim}, first + "; " + dkim},
 		{"none with assessments", []string{edge + "; (edge) none (done)", edge + "; dkim=pass", edge + "; NONE"}, edge + "; dkim=pass"},
 		{"none alone", []string{edge + "; none", edge + "; none"}, edge + "; none"},
+		{"none mixed with a method in the same field", []string{edge + "; none; dkim=pass"}, ""},
+		{"unclosed reason cannot absorb another field", []string{edge + "; spf=fail reason=\"unknown", edge + "; dkim=pass"}, ""},
+		{"folded result", []string{edge + "; spf=pass", edge + " (incoming) 1; dkim\r\n\t= pass"}, edge + "; spf=pass; dkim = pass"},
 		{"unknown field version excluded", []string{edge + " 2; dkim=fail", edge + "; spf=pass"}, edge + "; spf=pass"},
 		{"unknown field version alone", []string{edge + " 2; dkim=pass"}, ""},
 		{"no matching service", []string{"other.example; dkim=pass"}, ""},
@@ -27,7 +30,7 @@ func TestCombinedAuthenticationResults(t *testing.T) {
 				headers.WriteString("Authentication-Results: " + field + "\r\n")
 			}
 			message := []byte(headers.String() + baseMessage)
-			got, ok := FindAuthenticationResults(message, edge)
+			got, ok := CombinedAuthenticationResults(message, edge)
 			if ok != (tc.want != "") || got != tc.want {
 				t.Errorf("result = %q, %t; want %q", got, ok, tc.want)
 			}

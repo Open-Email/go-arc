@@ -32,7 +32,7 @@ oldest, ok := result.OldestAuthResults() // the i=1 AAR
 ## Sign
 
 ```go
-authRes, ok := arc.FindAuthenticationResults(rawMessage, "mx.example.com")
+authRes, ok := arc.CombinedAuthenticationResults(rawMessage, "mx.example.com")
 if !ok {
     // No edge-stamped Authentication-Results — forward without sealing.
 }
@@ -49,7 +49,7 @@ The signing domain and selector accept internationalized DNS labels such as `bü
 
 Design decisions, all load-bearing:
 
-- **`AuthResults` is required.** The AAR must carry what the ADMD's receiving edge actually observed (§5.1.1) — the edge stamps `Authentication-Results`, the message carries it to the egress, `FindAuthenticationResults` extracts it. A sealer with nothing to report must not seal; fabricated verdicts defeat the mechanism.
+- **`AuthResults` is required.** Use `CombinedAuthenticationResults` to collect all version 1 assessments from the configured authentication service into one AAR, including when the service stamped separate fields for SPF and DKIM. The receiving edge must remove inbound fields claiming its own authserv-id before stamping its results. Fields from other services are excluded. `FindAuthenticationResults` remains available for callers that need only the topmost matching field. [RFC 8617 §4.1.1](https://www.rfc-editor.org/rfc/rfc8617#section-4.1.1)
 - **`cv=` is computed, never assumed.** With prior sets present, the chain is validated (DNS required) and the seal declares the true result. On `fail`, the seal covers only the sealer's own set (§5.1.2).
 - **The seal is hand-computed, not borrowed from a DKIM signer.** It covers all prior ARC sets plus the new AAR and AMS, relaxed-canonicalized in instance order, and carries exactly the tags §4.1.3 allows: `i, a, b, cv, d, s, t` — no `bh=`, no `h=`, no `c=`, no `v=`.
 - **Everything signed is exactly what is emitted.** Headers are folded before hashing and the `b=` value is spliced into a frozen layout, so a verifier reconstructing the signed input gets identical bytes.

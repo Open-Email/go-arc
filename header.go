@@ -742,7 +742,8 @@ func foldAuthResultsClause(clause string) string {
 
 // splitAuthResultsClauses splits an Authentication-Results value at the ";"
 // separators between its clauses. A ";" inside a quoted string or a comment
-// is part of the value, not a separator (RFC 8601 §2.2).
+// is part of the value, not a separator (RFC 8601 §2.2). An unbalanced
+// comment or quoted string cannot be joined to another field and yields nil.
 func splitAuthResultsClauses(value string) []string {
 	var clauses []string
 	start, depth := 0, 0
@@ -759,6 +760,8 @@ func splitAuthResultsClauses(value string) []string {
 			depth++
 		case c == ')' && depth > 0:
 			depth--
+		case c == ')':
+			return nil
 		case depth > 0:
 			// ctext, including '"'
 		case c == '"':
@@ -767,6 +770,9 @@ func splitAuthResultsClauses(value string) []string {
 			clauses = append(clauses, value[start:i])
 			start = i + 1
 		}
+	}
+	if inQuote || depth != 0 {
+		return nil
 	}
 	return append(clauses, value[start:])
 }

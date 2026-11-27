@@ -46,7 +46,7 @@ func TestFieldNameIsExactASCII(t *testing.T) {
 		if len(headers) != 1 {
 			t.Fatalf("%s: parsed %d headers", name, len(headers))
 		}
-		if defect == "" {
+		if defect == nil {
 			t.Errorf("%s: %q passed as a well-formed header block", name, line)
 		}
 		if asciiEqualFold(headers[0].key, "subject") && !strings.HasPrefix(line, "Subject ") && !strings.HasPrefix(line, "Subject\t") {
@@ -55,8 +55,8 @@ func TestFieldNameIsExactASCII(t *testing.T) {
 	}
 	for _, line := range []string{"Subject: x", "SUBJECT:x", "subject:", "X-Odd!#$%&'*+-.^_`|~0: x", "Subject:\r\n folded"} {
 		headers, _, defect := parseMessage(line + "\r\n\r\nbody\r\n")
-		if defect != "" || len(headers) != 1 || asciiEqualFold(headers[0].key, "subject") == strings.HasPrefix(line, "X-") {
-			t.Errorf("%q: defect %q, headers %+v", line, defect, headers)
+		if defect != nil || len(headers) != 1 || asciiEqualFold(headers[0].key, "subject") == strings.HasPrefix(line, "X-") {
+			t.Errorf("%q: defect %v, headers %+v", line, defect, headers)
 		}
 	}
 }
@@ -94,12 +94,12 @@ func TestParseMessageReportsAMalformedHeaderBlock(t *testing.T) {
 		"too many fields":                  {strings.Repeat("a:\n", maxHeaderFields+1) + "\nbody", "more than"},
 	} {
 		_, _, defect := parseMessage(tc.msg)
-		if (tc.defect == "") != (defect == "") || !strings.Contains(defect, tc.defect) {
-			t.Errorf("%s: defect = %q, want one about %q", name, defect, tc.defect)
+		if (tc.defect == "") != (defect == nil) || (defect != nil && !strings.Contains(defect.Error(), tc.defect)) {
+			t.Errorf("%s: defect = %v, want one about %q", name, defect, tc.defect)
 		}
 	}
-	if headers, _, defect := parseMessage(strings.Repeat("a:\n", maxHeaderFields) + "\nbody"); defect != "" || len(headers) != maxHeaderFields {
-		t.Errorf("%d fields: defect %q, %d headers", maxHeaderFields, defect, len(headers))
+	if headers, _, defect := parseMessage(strings.Repeat("a:\n", maxHeaderFields) + "\nbody"); defect != nil || len(headers) != maxHeaderFields {
+		t.Errorf("%d fields: defect %v, %d headers", maxHeaderFields, defect, len(headers))
 	}
 	if headers, body, _ := parseMessage(strings.Repeat("a:\n", 5*maxHeaderFields) + "\nbody"); len(headers) != maxHeaderFields || body != "" {
 		t.Errorf("past the bound parseMessage kept %d headers and body %q", len(headers), body)
@@ -636,7 +636,8 @@ func TestVerifyDistinguishesIncompleteHeaderScanFromNoChain(t *testing.T) {
 func TestSignTransformedRequiresACompleteOriginalHeaderScan(t *testing.T) {
 	key, _, _ := testKeys(t)
 	cfg := signConfig(key, "forward-a.example", "sel-a", authResultsA, nil)
-	fields := strings.Repeat("X-Trace: relay.example\r\n", maxHeaderFields-7)
+	headers, _ := splitMessage(baseMessage)
+	fields := strings.Repeat("X-Trace: relay.example\r\n", maxHeaderFields-len(headers))
 	result, err := SignTransformed([]byte(fields+baseMessage), []byte(baseMessage), cfg)
 	if err != nil || result.Instance != 1 || result.CV != ChainNone {
 		t.Fatalf("SignTransformed at the limit = %v, %v, want a first-hop seal", result, err)

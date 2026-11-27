@@ -64,8 +64,8 @@ var ErrLineTooLong = errors.New("arc: a new ARC header line would exceed 998 byt
 // of one, a CR outside a line break, or more than 10,000 fields. Mail
 // software disagrees on how to read such a block, so a seal over it would
 // not mean the same message to every reader. The caller should forward the
-// message without adding an ARC set. Verify fails an existing chain on such
-// a message for the same reason.
+// message without adding an ARC set. Verify fails an existing chain for the same
+// reason and fails an incomplete header scan regardless of the ARC headers found.
 var ErrMalformedMessage = errors.New("arc: the header block of the message is malformed")
 
 // ChainStatus is the cv= value of an ARC-Seal.

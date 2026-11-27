@@ -86,7 +86,7 @@ func Sign(rawMessage []byte, cfg *SignConfig) (*SignResult, error) {
 // and the final outbound bytes after every change, including local DKIM signing.
 // The outbound message must preserve all ARC-* headers and their order byte for
 // byte. If a prior chain exists, it must validate on the original. A message
-// without prior ARC gets a first-hop seal.
+// without prior ARC gets a first-hop seal if the original header scan completed.
 func SignTransformed(original, outbound []byte, cfg *SignConfig) (*SignResult, error) {
 	return sign(original, outbound, cfg, true)
 }
@@ -135,15 +135,18 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 
 	raw := string(outbound)
 	headers, body, defect := parseMessage(raw)
-	if defect != "" {
-		return nil, fmt.Errorf("%w: %s", ErrMalformedMessage, defect)
+	if defect != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, defect)
 	}
 	if len(headers)+3 > maxHeaderFields {
 		// With the three new fields Verify would refuse the result.
 		return nil, fmt.Errorf("%w: more than %d header fields with the new ARC set", ErrMalformedMessage, maxHeaderFields)
 	}
 	if transformed {
-		priorHeaders, _ := splitMessage(string(original))
+		priorHeaders, _, priorDefect := parseMessage(string(original))
+		if priorDefect == errHeaderFieldLimit {
+			return nil, fmt.Errorf("%w: original has %v", ErrMalformedMessage, priorDefect)
+		}
 		if !slices.Equal(arcHeaderBytes(priorHeaders), arcHeaderBytes(headers)) {
 			return nil, ErrARCHeadersChanged
 		}

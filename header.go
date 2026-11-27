@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -120,6 +121,8 @@ func isARCHeader(key string) bool {
 // from costing gigabytes.
 const maxHeaderFields = 10000
 
+var errHeaderFieldLimit = fmt.Errorf("more than %d header fields", maxHeaderFields)
+
 // splitMessage splits a message into its header fields and body,
 // preserving each header's exact raw bytes. Both CRLF and bare LF line
 // endings are tolerated; the raw bytes are kept as found.
@@ -129,7 +132,7 @@ func splitMessage(raw string) ([]rawHeader, string) {
 }
 
 // parseMessage is splitMessage, and also reports the first defect of the
-// header block, or "" when every line of it is one of:
+// header block, or nil when every line of it is one of:
 //
 //   - a header field: a name of printable ASCII characters other than ":",
 //     directly followed by ":" (RFC 5322 §2.2);
@@ -151,13 +154,14 @@ func splitMessage(raw string) ([]rawHeader, string) {
 // parts more strictly can still be shown a part boundary differently.
 //
 // The header block ends at the first empty line (CRLF or LF alone), or at a
-// lone CR that ends the input. Past maxHeaderFields the rest of the input is
-// not read and body is "".
-func parseMessage(raw string) (headers []rawHeader, body string, defect string) {
+// lone CR that ends the input. Past maxHeaderFields it returns a partial
+// header block, an empty body and errHeaderFieldLimit even if an earlier
+// line was malformed.
+func parseMessage(raw string) (headers []rawHeader, body string, defect error) {
 	curStart := -1
 	note := func(d string) {
-		if defect == "" {
-			defect = d
+		if defect == nil {
+			defect = errors.New(d)
 		}
 	}
 	flush := func(end int) {
@@ -210,8 +214,7 @@ func parseMessage(raw string) (headers []rawHeader, body string, defect string) 
 		} else {
 			flush(pos)
 			if len(headers) >= maxHeaderFields {
-				note(fmt.Sprintf("more than %d header fields", maxHeaderFields))
-				return headers, "", defect
+				return headers, "", errHeaderFieldLimit
 			}
 			curStart = pos
 			colon := strings.IndexByte(content, ':')

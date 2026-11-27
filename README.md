@@ -15,7 +15,7 @@ result, err := arc.Verify(rawMessage, &arc.VerifyOptions{
 // result.Pass, result.Instance, result.FailureReasons
 ```
 
-A message with no ARC headers passes (nothing to validate). A chain passes only if every instance 1..N is complete, every `cv=` is semantically valid (`none` at i=1, `pass` above, any `fail` is fatal), and every signature verifies.
+A message with no ARC headers passes once the verifier has scanned the complete header block. Exceeding the 10,000-field scan limit produces a failed result. A chain passes only if every instance 1..N is complete, every `cv=` is semantically valid (`none` at i=1, `pass` above, any `fail` is fatal), and every signature verifies.
 
 `result.Instances` reports what each set in the chain *claims* — oldest first, and populated for failing chains too:
 
@@ -59,7 +59,7 @@ Use `arc.SignTransformed(original, outbound, cfg)` after modifying a message.
 Set `cfg.AuthResults` from the original ingress observations. The function validates any
 prior ARC chain against `original` and signs the final `outbound` bytes. It requires
 the same ARC headers in the same order and returns an error if the prior chain
-cannot validate.
+cannot validate. An incomplete scan of the original returns `ErrMalformedMessage`.
 
 ## Testing
 

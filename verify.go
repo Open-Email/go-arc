@@ -113,7 +113,7 @@ type arcSet struct {
 
 // Verify validates the ARC chain of a message per RFC 8617 §5.2.
 //
-// A message with no ARC headers passes (there is nothing to validate).
+// A message with no ARC headers passes if the complete header block was scanned.
 // A message with ARC headers passes only if its header block is well
 // formed (parseMessage: a line that mail readers may read differently
 // fails the chain), every instance from 1 to N is complete, every cv=
@@ -136,7 +136,7 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 	headers, body, defect := parseMessage(string(rawMessage))
 	sets, maxInstance, problems := extractARCSets(headers)
 
-	if maxInstance == 0 && len(sets) == 0 && len(problems) == 0 {
+	if defect != errHeaderFieldLimit && maxInstance == 0 && len(sets) == 0 && len(problems) == 0 {
 		logger.Debug("no ARC headers found")
 		return &VerifyResult{Pass: true, ChainValid: true, Instance: 0}, nil
 	}
@@ -151,8 +151,8 @@ func Verify(rawMessage []byte, opts *VerifyOptions) (*VerifyResult, error) {
 		return result, nil
 	}
 	result.Instances = collectInstances(sets, maxInstance)
-	if defect != "" {
-		result.FailureReasons = append(result.FailureReasons, "malformed header block: "+defect)
+	if defect != nil {
+		result.FailureReasons = append(result.FailureReasons, "malformed header block: "+defect.Error())
 	}
 	if len(result.FailureReasons) > 0 {
 		return result, nil
@@ -561,7 +561,7 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 	}
 	headers, _ := splitMessage(string(rawMessage))
 	for _, h := range headers {
-		if _, _, defect := parseMessage(h.raw); defect != "" {
+		if _, _, defect := parseMessage(h.raw); defect != nil {
 			return "", false
 		}
 		if asciiEqualFold(h.key, "Authentication-Results") && authservIDIs(h.value, authservID) {

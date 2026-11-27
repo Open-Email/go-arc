@@ -46,10 +46,12 @@ type InstanceResult struct {
 	// Signer is the ARC-Message-Signature d=. Normally equal to Sealer;
 	// RFC 8617 does not require it, so both are reported.
 	Signer string
-	// ChainStatus is the seal's cv= exactly as found. Verify has already
-	// rejected the chain if it is not none at i=1 and pass above, so on a
-	// passing result this carries no new information — it is here for the
-	// failing ones.
+	// ChainStatus is the seal's cv=. RFC 8617 §3.9 makes none, pass and
+	// fail case-insensitive, so those are reported in lowercase, as
+	// ChainNone, ChainPass and ChainFail; any other value is reported
+	// exactly as found. Verify has already rejected the chain if it is not
+	// none at i=1 and pass above, so on a passing result this carries no new
+	// information. It is here for the failing ones.
 	ChainStatus ChainStatus
 	// AuthResults is the ARC-Authentication-Results payload with the i=
 	// tag stripped and folds removed: the authserv-id followed by the
@@ -634,9 +636,11 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 // It reports nothing (false) rather than guess when the service's results
 // cannot be read whole: a field with an unbalanced comment or quoted string,
 // an empty result such as a trailing ";", "none" beside other results in one
-// field, results over 64 KiB in all, or a header block of more than 10,000
-// fields. Like FindAuthenticationResults it stops at the first line that is
-// not a well-formed header field, and fields of other versions are skipped.
+// field, more than 64 KiB of results as they arrive, a combined value over
+// 64 KiB (the most Sign accepts, counting the service identifier and the
+// separators added here), or a header block of more than 10,000 fields.
+// Like FindAuthenticationResults it stops at the first line that is not a
+// well-formed header field, and fields of other versions are skipped.
 func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	if authservID == "" {
 		return "", false

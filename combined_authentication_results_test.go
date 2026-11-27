@@ -174,3 +174,43 @@ func TestCombinedAuthenticationResultsPayloadLimit(t *testing.T) {
 		t.Errorf("added separators: got %d bytes, ok=%t", len(got), ok)
 	}
 }
+
+// TestCombinedAuthenticationResultsSeparatorBoundary pins the limit where the
+// "; " the combiner puts between methods decides it. The field carries one
+// ";" per method, so without the added spaces every size below would fit.
+// What the combiner returns at the limit, Sign accepts.
+func TestCombinedAuthenticationResultsSeparatorBoundary(t *testing.T) {
+	const edge = "edge.example"
+	const method = "spf=pass"
+	const last = "dkim=pass header.d="
+	key, _, _ := testKeys(t)
+	for _, size := range []int{maxAuthResultsBytes, maxAuthResultsBytes + 1, maxAuthResultsBytes + 2} {
+		// The combined value is edge, "; "+method for each method, then
+		// "; "+last padded to size. The field folds after every 80 methods.
+		var field strings.Builder
+		field.WriteString(edge)
+		combined := len(edge)
+		for i := 1; combined+len("; "+method)+len("; "+last)+1 <= size; i++ {
+			field.WriteString(";" + method)
+			combined += len("; " + method)
+			if i%80 == 0 {
+				field.WriteString("\r\n ")
+			}
+		}
+		field.WriteString(";" + last + strings.Repeat("a", size-combined-len("; "+last)))
+		msg := []byte("Authentication-Results: " + field.String() + "\r\n" + baseMessage)
+		got, ok := CombinedAuthenticationResults(msg, edge)
+		if size > maxAuthResultsBytes {
+			if ok || got != "" {
+				t.Errorf("a %d-byte combined value: got %d bytes, ok=%t", size, len(got), ok)
+			}
+			continue
+		}
+		if !ok || len(got) != size {
+			t.Fatalf("a %d-byte combined value: got %d bytes, ok=%t", size, len(got), ok)
+		}
+		if _, err := Sign(msg, signConfig(key, edge, "s1", got, nil)); err != nil {
+			t.Fatalf("Sign refused the combined value at the limit: %v", err)
+		}
+	}
+}

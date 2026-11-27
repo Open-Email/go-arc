@@ -619,6 +619,36 @@ func TestMalformedMessageWithoutAChainStillPasses(t *testing.T) {
 	}
 }
 
+func TestVerifyDistinguishesIncompleteHeaderScanFromNoChain(t *testing.T) {
+	fields := strings.Repeat("X-Trace: relay.example\r\n", maxHeaderFields)
+	const end = "\r\nOrdinary mail.\r\n"
+	if got := mustVerify(t, []byte(fields+end), nil); !got.Pass || !got.ChainValid || got.Instance != 0 || len(got.FailureReasons) != 0 {
+		t.Errorf("Verify at the limit = %+v, want a pass with no chain", got)
+	}
+	for _, field := range []string{"X-Trace: next.example\r\n", "Invalid field\r\n"} {
+		got := mustVerify(t, []byte(field+fields+end), nil)
+		if got.Pass || got.ChainValid || got.Instance != 0 || !strings.Contains(strings.Join(got.FailureReasons, " "), "more than") {
+			t.Errorf("Verify over the limit beginning with %q = %+v, want a header limit failure", field, got)
+		}
+	}
+}
+
+func TestSignTransformedRequiresACompleteOriginalHeaderScan(t *testing.T) {
+	key, _, _ := testKeys(t)
+	cfg := signConfig(key, "forward-a.example", "sel-a", authResultsA, nil)
+	fields := strings.Repeat("X-Trace: relay.example\r\n", maxHeaderFields-7)
+	result, err := SignTransformed([]byte(fields+baseMessage), []byte(baseMessage), cfg)
+	if err != nil || result.Instance != 1 || result.CV != ChainNone {
+		t.Fatalf("SignTransformed at the limit = %v, %v, want a first-hop seal", result, err)
+	}
+	for _, field := range []string{"X-Trace: next.example\r\n", "Invalid field\r\n"} {
+		result, err := SignTransformed([]byte(field+fields+baseMessage), []byte(baseMessage), cfg)
+		if result != nil || !errors.Is(err, ErrMalformedMessage) || !strings.Contains(err.Error(), "more than") {
+			t.Errorf("SignTransformed over the limit beginning with %q = (%t, %v), want a header limit failure", field, result != nil, err)
+		}
+	}
+}
+
 // The signature lists every default name once per field of that name and
 // once more (RFC 6376 §5.4, §8.15), so no field of such a name can be added
 // after sealing: not a second copy above the signed one, and not one the

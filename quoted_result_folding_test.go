@@ -5,6 +5,23 @@ import (
 	"testing"
 )
 
+func TestFoldBetweenResultsAfterShortContinuation(t *testing.T) {
+	// The first result ends on a short continuation. The second result
+	// occupies a full line with its required leading space.
+	first := "spf=neutral reason=\"" + strings.Repeat("x", 80) + " short\""
+	second := "dkim=pass(" + strings.Repeat("n", 986) + ")"
+	auth := "relay.example; " + first + "; " + second
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"m1._domainkey.relay.example": txtFor(t, key)})
+	set, err := Sign([]byte(baseMessage), signConfig(key, "relay.example", "m1", auth, lookup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := mustVerify(t, set.Message, lookup).OldestAuthResults(); !ok || got != auth {
+		t.Fatal("the second result did not round-trip")
+	}
+}
+
 func TestLegalFoldsInLongQuotedResult(t *testing.T) {
 	key, _, _ := testKeys(t)
 	lookup := dnsStub(map[string]string{"m1._domainkey.relay.example": txtFor(t, key)})

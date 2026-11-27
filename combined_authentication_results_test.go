@@ -140,3 +140,37 @@ func TestSignTurnsAStrayLineBreakInQuotesIntoASpace(t *testing.T) {
 		}
 	}
 }
+
+func TestCombinedAuthenticationResultsPayloadLimit(t *testing.T) {
+	const edge = "edge.example"
+	const field = "Authentication-Results: "
+	for _, n := range []int{maxAuthResultsBytes, maxAuthResultsBytes + 1} {
+		// Fold the service comment at spaces. Unfolding removes each CRLF
+		// but retains its following space in the returned prefix.
+		commentBytes := n - len(edge+" () 1; none")
+		line := strings.Repeat("x", 850)
+		complete, extra := commentBytes/(len(line)+1), commentBytes%(len(line)+1)
+		comment := strings.Repeat(line+"\r\n ", complete) + strings.Repeat("y", extra)
+		value := edge + " (" + comment + ") 1; none"
+		got, ok := CombinedAuthenticationResults([]byte(field+value+"\r\n"+baseMessage), edge)
+		if n == maxAuthResultsBytes {
+			if !ok || got != strings.ReplaceAll(value, "\r\n", "") {
+				t.Errorf("at %d bytes: got %d bytes, ok=%t", n, len(got), ok)
+			}
+		} else if ok || got != "" {
+			t.Errorf("at %d bytes: got %d bytes, ok=%t", n, len(got), ok)
+		}
+	}
+
+	// Each method below is separated by one semicolon on input. The
+	// combiner joins methods with a semicolon and a space. This field is
+	// under the input cap, but its assembled payload exceeds the limit.
+	line := strings.Repeat(";spf=pass", 70)
+	value := edge + strings.Repeat(line+"\r\n ", 99) + ";dkim=pass"
+	if len(value) >= maxAuthResultsBytes {
+		t.Fatal("separator fixture exceeds raw input limit")
+	}
+	if got, ok := CombinedAuthenticationResults([]byte(field+value+"\r\n"+baseMessage), edge); ok || got != "" {
+		t.Errorf("added separators: got %d bytes, ok=%t", len(got), ok)
+	}
+}

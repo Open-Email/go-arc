@@ -146,3 +146,51 @@ func TestVerifySealTagFoldingAndComments(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifySealStatusCase(t *testing.T) {
+	keyA, keyB, _ := testKeys(t)
+	for _, tc := range []struct {
+		status   string
+		hops     int
+		expected ChainStatus
+	}{
+		{"none", 1, ChainNone},
+		{"NONE", 1, ChainNone},
+		{"PaSs", 2, ChainPass},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			chain, lookup := testChain(t, tc.hops)
+			headers, _ := splitMessage(string(chain))
+			seal := headers[0]
+			unsigned := strings.Replace(removeSignatureValue(seal.raw), "cv="+string(tc.expected), "cv="+tc.status, 1) + "\r\n"
+			hasher := sha256.New()
+			for _, field := range arcHeadersUpTo(headers, tc.hops) {
+				hasher.Write([]byte(canonicalizeHeaderRaw(field.raw, canonRelaxed)))
+			}
+			hasher.Write([]byte(trimLineBreak(canonicalizeHeaderRaw(unsigned, canonRelaxed))))
+			key := keyA
+			if tc.hops == 2 {
+				key = keyB
+			}
+			signature, err := signHash(key, hasher.Sum(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed, err := spliceSignature(unsigned, signature)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg := []byte(signed + string(chain[len(seal.raw):]))
+			got := mustVerify(t, msg, lookup)
+			if !got.Pass || !got.ChainValid || len(got.Instances) != tc.hops || got.Instances[tc.hops-1].ChainStatus != tc.expected {
+				t.Fatalf("cv=%s: %+v", tc.status, got)
+			}
+			if tc.status != string(tc.expected) {
+				edited := strings.Replace(string(msg), "cv="+tc.status, "cv="+string(tc.expected), 1)
+				if mustVerify(t, []byte(edited), lookup).Pass {
+					t.Fatal("changing signed status bytes without signing again passed verification")
+				}
+			}
+		})
+	}
+}

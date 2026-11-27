@@ -487,14 +487,21 @@ func collapseASCIIWSP(s string) string {
 // intact (RFC 5322 §§2.2.3, 3.2.4). Outside those constructs, whitespace
 // separates tokens and can be normalized for the combined AAR.
 func unfoldAuthenticationResults(value string) string {
-	if !strings.ContainsAny(value, "\"(") {
-		return collapseASCIIWSP(value)
+	result, _ := unfoldAuthenticationResultsWithin(value, len(value))
+	return result
+}
+
+// Unfolding can remove CRLFs and collapse whitespace. Limit the unfolded
+// value while writing it, even when a long folded service prefix is supplied.
+func unfoldAuthenticationResultsWithin(value string, limit int) (string, bool) {
+	if len(value) <= limit && !strings.ContainsAny(value, "\"(") {
+		return collapseASCIIWSP(value), true
 	}
 	var out strings.Builder
-	out.Grow(len(value))
+	out.Grow(min(len(value), limit))
 	depth := 0
 	quoted, escaped, pendingSpace := false, false, false
-	for i := 0; i < len(value); i++ {
+	for i := 0; i < len(value) && out.Len() <= limit; i++ {
 		c := value[i]
 		if !quoted && depth == 0 {
 			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
@@ -529,7 +536,10 @@ func unfoldAuthenticationResults(value string) string {
 			depth--
 		}
 	}
-	return out.String()
+	if out.Len() > limit {
+		return "", false
+	}
+	return out.String(), true
 }
 
 // relaxedHeaderValue applies RFC 6376 §3.4.2 to a field value, read exactly:

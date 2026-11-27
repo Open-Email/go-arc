@@ -226,6 +226,17 @@ func extractARCSets(headers []rawHeader) (map[int]*arcSet, int, []string) {
 	return sets, maxInstance, problems
 }
 
+// RFC 8617 §3.9 uses case-insensitive ABNF literals for chain-status.
+// Keep an unrecognized value intact for the failure report.
+func parsedChainStatus(value string) ChainStatus {
+	for _, status := range [...]ChainStatus{ChainNone, ChainPass, ChainFail} {
+		if asciiEqualFold(value, string(status)) {
+			return status
+		}
+	}
+	return ChainStatus(value)
+}
+
 // collectInstances flattens the extracted sets into the per-instance report,
 // oldest first. It reads the headers only — no cryptography — so it describes
 // a failing chain as readily as a passing one; whether any of it may be
@@ -248,7 +259,7 @@ func collectInstances(sets map[int]*arcSet, maxInstance int) []InstanceResult {
 		if set.hasSeal {
 			tags, _ := parseTagList(set.seal.value, true)
 			inst.Sealer = tags["d"]
-			inst.ChainStatus = ChainStatus(tags["cv"])
+			inst.ChainStatus = parsedChainStatus(tags["cv"])
 		}
 		if set.hasAMS {
 			inst.Signer = parseTags(set.ams.value)["d"]
@@ -284,7 +295,7 @@ func validateChain(headers []rawHeader, body string, sets map[int]*arcSet, maxIn
 		if err != nil {
 			return false, []string{fmt.Sprintf("ARC-Seal at instance %d: %v", i, err)}
 		}
-		cv := ChainStatus(tags["cv"])
+		cv := parsedChainStatus(tags["cv"])
 		switch {
 		case i == 1 && cv != ChainNone:
 			return false, []string{fmt.Sprintf("ARC-Seal at instance 1 must have cv=none, found %q", cv)}
@@ -634,9 +645,9 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 	if defect == errHeaderFieldLimit {
 		return "", false
 	}
-	var prefix string
-	var results []string
-	size := 0
+	var payload strings.Builder
+	hasMethods := false
+	rawSize := 0
 	for _, h := range headers {
 		if defect != nil {
 			// As in the topmost lookup, trust only the unambiguous prefix.
@@ -651,8 +662,15 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 		if !ok || rest == "" || version != "" && version != "1" {
 			continue
 		}
-		if size += len(rest); size > maxAuthResultsBytes {
+		if rawSize += len(rest); rawSize > maxAuthResultsBytes {
 			return "", false
+		}
+		if payload.Len() == 0 {
+			prefix, ok := unfoldAuthenticationResultsWithin(h.value[:len(h.value)-len(rest)], maxAuthResultsBytes)
+			if !ok {
+				return "", false
+			}
+			payload.WriteString(prefix)
 		}
 		clauses := splitAuthResultsClauses(rest[1:])
 		if clauses == nil {
@@ -667,21 +685,26 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 				if len(clauses) != 1 {
 					return "", false
 				}
-			} else {
-				results = append(results, value)
+				continue
 			}
-		}
-		if prefix == "" {
-			prefix = unfoldAuthenticationResults(h.value[:len(h.value)-len(rest)])
+			if len("; ")+len(value) > maxAuthResultsBytes-payload.Len() {
+				return "", false
+			}
+			payload.WriteString("; ")
+			payload.WriteString(value)
+			hasMethods = true
 		}
 	}
-	if prefix == "" {
+	if payload.Len() == 0 {
 		return "", false
 	}
-	if len(results) == 0 {
-		return prefix + "; none", true
+	if !hasMethods {
+		if len("; none") > maxAuthResultsBytes-payload.Len() {
+			return "", false
+		}
+		payload.WriteString("; none")
 	}
-	return prefix + "; " + strings.Join(results, "; "), true
+	return payload.String(), true
 }
 
 // The no-result production permits CFWS on both sides of "none".

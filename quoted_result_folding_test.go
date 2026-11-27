@@ -12,6 +12,9 @@ func TestLegalFoldsInLongQuotedResult(t *testing.T) {
 		{"unescaped and escaped tabs", strings.Repeat("amber\\\tgold\r\n\t", 100) + "done"},
 		{"folded whitespace within one quoted value", "amber" + strings.Repeat("\t", 80) + "\r\n" + strings.Repeat("\t", 80) + "gold"},
 		{"fold inside a long whitespace run", "amber" + strings.Repeat("\t", 760) + "\r\n" + strings.Repeat("\t", 760) + "gold"},
+		// Both continuation lines, including their leading WSP and the
+		// closing quote on the last line, fit the 998-octet limit.
+		{"consecutive near-limit words", "info    \r\n " + strings.Repeat("a", 994) + "   \r\n  " + strings.Repeat("b", 995)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const prefix = "relay.example; dkim=neutral reason=\""

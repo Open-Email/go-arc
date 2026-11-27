@@ -17,7 +17,8 @@ func TestFoldBetweenResultsAfterShortContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := mustVerify(t, set.Message, lookup).OldestAuthResults(); !ok || got != auth {
+	verified := mustVerify(t, set.Message, lookup)
+	if got, ok := verified.OldestAuthResults(); !verified.Pass || !ok || got != auth {
 		t.Fatal("the second result did not round-trip")
 	}
 }

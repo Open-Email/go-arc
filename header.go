@@ -760,9 +760,24 @@ func foldAuthResultsClause(clause string) string {
 	if 2+len(clause)+1 <= headerFoldWrap {
 		return clause
 	}
+	if folded, ok := foldAuthResultsWords(clause, false); ok {
+		return folded
+	}
+	folded, _ := foldAuthResultsWords(clause, true)
+	return folded
+}
+
+// The first pass prefers the usual line width. If it reaches the physical
+// limit, fold at every available whitespace run and place as much of that
+// run as possible on the preceding line. This leaves the shortest possible
+// continuation for each word, maximizing room for all subsequent folds.
+func foldAuthResultsWords(clause string, useAllFolds bool) (string, bool) {
 	var sb strings.Builder
 	sb.Grow(len(clause) + len(clause)/headerFoldWrap*2)
 	lineLen := 2
+	if useAllFolds {
+		lineLen = 1 // foldHeader can use a single continuation SP at the limit.
+	}
 	for start := 0; start < len(clause); {
 		word := start
 		for word < len(clause) && (clause[word] == ' ' || clause[word] == '\t') {
@@ -775,11 +790,14 @@ func foldAuthResultsClause(clause string) string {
 			}
 			end++
 		}
-		if word > start && lineLen+end-start+1 > headerFoldWrap {
+		if word > start && (useAllFolds || lineLen+end-start+1 > headerFoldWrap) {
 			// A whitespace run can take only one fold: a second would
 			// create a WSP-only physical line (RFC 5322 §2.2.3). For a
 			// long run leave enough of it here for the next line to fit.
 			before := max(0, end-start+1-maxLineLength)
+			if useAllFolds {
+				before = word - start - 1
+			}
 			before = min(before, word-start-1, max(0, maxLineLength-lineLen))
 			sb.WriteString(clause[start : start+before])
 			sb.WriteString("\r\n")
@@ -788,9 +806,12 @@ func foldAuthResultsClause(clause string) string {
 		}
 		sb.WriteString(clause[start:end])
 		lineLen += end - start
+		if !useAllFolds && (lineLen > maxLineLength || end == len(clause) && lineLen+1 > maxLineLength) {
+			return "", false
+		}
 		start = end
 	}
-	return sb.String()
+	return sb.String(), true
 }
 
 // splitAuthResultsClauses splits an Authentication-Results value at the ";"
@@ -848,9 +869,14 @@ func foldHeader(name string, tags []string) string {
 		if nl := strings.Index(chunk, "\r\n"); nl >= 0 {
 			firstLineLen = nl
 		}
-		if lineLen+firstLineLen > headerFoldWrap && lineLen > len(name)+1 {
-			sb.WriteString("\r\n\t")
-			lineLen = 1
+		if i > 0 && lineLen+firstLineLen > headerFoldWrap {
+			sb.WriteString("\r\n")
+			lineLen = 0
+			if firstLineLen < maxLineLength {
+				sb.WriteByte('\t')
+				lineLen = 1
+			}
+			// chunk itself starts with SP, sufficient for a continuation.
 		}
 		sb.WriteString(chunk)
 		if nl := strings.LastIndex(chunk, "\r\n"); nl >= 0 {

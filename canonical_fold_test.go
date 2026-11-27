@@ -49,6 +49,35 @@ func TestSplitAuthResultsClausesKeepsQuotedAndCommentedSemicolons(t *testing.T) 
 	}
 }
 
+func TestSignPreservesQuotedPairsWhenFoldingAuthResults(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"mail._domainkey.relay.example": txtFor(t, key)})
+	prefix := strings.Repeat("a", 67)
+	for _, tc := range []struct{ name, reason, wire string }{
+		{"escaped space in quoted reason", `reason="` + prefix + `\ delivery delayed"`, `\ delivery`},
+		{"escaped space in comment", "(" + prefix + `\ delivery delayed)`, `\ delivery`},
+		{"fold after escaped backslash", `reason="` + prefix + `\\ delivery delayed"`, `\\` + "\r\n delivery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			authResults := "auth.example; dkim=temperror " + tc.reason
+			cfg := signConfig(key, "relay.example", "mail", authResults, lookup)
+			signed, err := Sign([]byte(baseMessage), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(signed.Message), tc.wire) {
+				t.Errorf("folded ARC-Authentication-Results lost the expected sequence %q", tc.wire)
+			}
+			if _, payload, ok := LatestARCAuthResults(signed.Message); !ok || payload != authResults {
+				t.Errorf("unfolded authentication results = %q, want %q", payload, authResults)
+			}
+			if verified := mustVerify(t, signed.Message, lookup); !verified.Pass {
+				t.Errorf("verification failed: %v", verified.FailureReasons)
+			}
+		})
+	}
+}
+
 // Header names are ASCII (RFC 5322 §3.6.8). A Unicode look-alike such as
 // "ſubject" (U+017F, which strings.EqualFold folds to "s") is a different
 // header to every other implementation, so it must never take a signed

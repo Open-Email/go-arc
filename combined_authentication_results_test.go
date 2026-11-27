@@ -42,3 +42,26 @@ func TestCombinedAuthenticationResults(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthenticationResultsStopAtFirstDefectiveField(t *testing.T) {
+	const edge = "edge.example"
+	const value = edge + "; none"
+	const field = "Authentication-Results: " + value + "\r\n"
+	for name, lookup := range map[string]func([]byte, string) (string, bool){
+		"topmost": FindAuthenticationResults, "combined": CombinedAuthenticationResults,
+	} {
+		for _, tc := range []struct{ name, message, want string }{
+			{"valid folded subject", "Subject: meeting\r\n notes\r\n" + field, value},
+			{"orphan continuation", "\tmeeting notes\r\n" + field, ""},
+			{"field before defect", field + "missing colon\r\n", value},
+			{"invalid continuation of field", field + " notes\rfrom calendar\r\n", ""},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				got, ok := lookup([]byte(tc.message+"\r\n"), edge)
+				if got != tc.want || ok != (tc.want != "") {
+					t.Fatalf("got (%q, %t), want (%q, %t)", got, ok, tc.want, tc.want != "")
+				}
+			})
+		}
+	}
+}

@@ -428,11 +428,12 @@ func TestCanonicalizationTagAcceptsOnlyKnownValues(t *testing.T) {
 
 // handSealOptions change the first-hop ARC set that handSeal builds.
 type handSealOptions struct {
-	amsC      string              // AMS c= tag; default relaxed/relaxed
-	bh        func(string) string // rewrites the bh= value before signing
-	amsTags   []string            // extra AMS tags, before b=
-	sealTags  []string            // extra seal tags, before b=
-	mutateAMS func(string) string // changes the signed AMS before the seal covers it
+	amsC       string              // AMS c= tag; default relaxed/relaxed
+	bh         func(string) string // rewrites the bh= value before signing
+	amsTags    []string            // extra AMS tags, before b=
+	sealTags   []string            // extra seal tags, before b=
+	mutateAMS  func(string) string // changes the signed AMS before the seal covers it
+	formatSeal func(string) string // changes the unsigned seal before hashing
 }
 
 // handSeal builds a first-hop ARC set over msg by hand, canonicalizing as
@@ -477,6 +478,9 @@ func handSeal(t *testing.T, key *rsa.PrivateKey, msg string, opt handSealOptions
 	}
 	sealTags := []string{"i=1", "a=rsa-sha256", fmt.Sprintf("t=%d", fixedNow().Unix()), "cv=none", "d=forward-a.example", "s=sel-a"}
 	sealUnsigned := foldHeader("ARC-Seal", append(append(sealTags, opt.sealTags...), "b="))
+	if opt.formatSeal != nil {
+		sealUnsigned = opt.formatSeal(sealUnsigned)
+	}
 	hasher = sha256.New()
 	hasher.Write([]byte(canonicalizeHeaderRaw(aar, canonRelaxed)))
 	hasher.Write([]byte(canonicalizeHeaderRaw(ams, canonRelaxed)))
@@ -485,10 +489,8 @@ func handSeal(t *testing.T, key *rsa.PrivateKey, msg string, opt handSealOptions
 	if err != nil {
 		t.Fatal(err)
 	}
-	seal, err := spliceSignature(sealUnsigned, sealSig)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The fixture puts the signature last, also when the b tag is folded.
+	seal := strings.TrimSuffix(sealUnsigned, "\r\n") + sealSig + "\r\n"
 	return []byte(seal + ams + aar + msg)
 }
 

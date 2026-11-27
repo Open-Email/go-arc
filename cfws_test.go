@@ -122,3 +122,27 @@ func TestVerifyInstanceCommentsContainingSignatureTag(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifySealTagFoldingAndComments(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	for _, tc := range []struct {
+		name, cv, b string
+	}{
+		{"ordinary", "cv=none", "b="},
+		{"fold before signature equals", "cv=none", "b\r\n\t="},
+		{"comment before status", "cv= (first hop) none", "b="},
+		{"comments around status equals", "cv (relay; east) =\r\n\t(message (received); morning) none", "b="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := handSeal(t, key, baseMessage, handSealOptions{formatSeal: func(unsigned string) string {
+				unsigned = strings.Replace(unsigned, "cv=none", tc.cv, 1)
+				return strings.TrimSuffix(unsigned, "b=\r\n") + tc.b + "\r\n"
+			}})
+			got := mustVerify(t, msg, lookup)
+			if !got.Pass || !got.ChainValid || len(got.Instances) != 1 || got.Instances[0].ChainStatus != ChainNone {
+				t.Fatalf("first-hop seal failed: %+v", got)
+			}
+		})
+	}
+}

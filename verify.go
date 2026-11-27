@@ -408,8 +408,7 @@ func verifySignature(headerName string, sig rawHeader, headers []rawHeader, body
 	if domain == "" || selector == "" {
 		return fmt.Errorf("missing d= or s= tag")
 	}
-	domain, selector, err = keyDNSNames(domain, selector)
-	if err != nil {
+	if domain, selector, err = verifyKeyDNSNames(domain, selector); err != nil {
 		return err
 	}
 
@@ -542,6 +541,41 @@ func selectHeaders(headerName, hTag string, headers []rawHeader) ([]rawHeader, e
 	return out, nil
 }
 
+// verifyKeyDNSNames returns the DNS names to look a signer's key up under.
+// U-labels are converted to A-labels (RFC 8616 §4). An ASCII name is used
+// as written, as other verifiers do, as long as DNS can hold it: Sign's
+// stricter host-name grammar would fail seals made by others with names
+// such as "mail_relay.example" or "localhost".
+func verifyKeyDNSNames(domain, selector string) (string, string, error) {
+	if hasNonASCII(domain) || hasNonASCII(selector) {
+		d, s, err := keyDNSNames(domain, selector)
+		if err != nil {
+			return "", "", fmt.Errorf("d= and s= do not form a DNS name for the key: %q, %q", domain, selector)
+		}
+		return d, s, nil
+	}
+	if !dnsHoldable(domain) || !dnsHoldable(selector) || len(selector)+len("._domainkey.")+len(domain) > 253 {
+		return "", "", fmt.Errorf("d= and s= do not form a DNS name for the key: %q, %q", domain, selector)
+	}
+	return domain, selector, nil
+}
+
+// dnsHoldable reports whether an ASCII name is dot-separated labels of 1 to
+// 63 printable characters.
+func dnsHoldable(name string) bool {
+	for label := range strings.SplitSeq(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			if label[i] <= ' ' || label[i] > '~' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // FindAuthenticationResults returns the value of the topmost
 // Authentication-Results header whose authserv-id is authservID
 // (ASCII case-insensitive), with each run of whitespace, CR and LF turned
@@ -583,7 +617,15 @@ func FindAuthenticationResults(rawMessage []byte, authservID string) (string, bo
 // wire order (RFC 8617 §4.1.1). The service identifier may be a token or a
 // quoted string. A field stating "none" contributes no methods.
 // As with FindAuthenticationResults, the caller must ensure that only its
-// trusted ingress can supply fields naming this service (RFC 8601 §5).
+// trusted ingress can supply fields naming this service (RFC 8601 §5): every
+// such field is combined, wherever it stands.
+//
+// It reports nothing (false) rather than guess when the service's results
+// cannot be read whole: a field with an unbalanced comment or quoted string,
+// an empty result such as a trailing ";", "none" beside other results in one
+// field, results over 64 KiB in all, or a header block of more than 10,000
+// fields. Like FindAuthenticationResults it stops at the first line that is
+// not a well-formed header field, and fields of other versions are skipped.
 func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string, bool) {
 	if authservID == "" {
 		return "", false
@@ -594,6 +636,7 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 	}
 	var prefix string
 	var results []string
+	size := 0
 	for _, h := range headers {
 		if defect != nil {
 			// As in the topmost lookup, trust only the unambiguous prefix.
@@ -607,6 +650,9 @@ func CombinedAuthenticationResults(rawMessage []byte, authservID string) (string
 		version, rest, ok := authservIDParts(h.value, authservID, true)
 		if !ok || rest == "" || version != "" && version != "1" {
 			continue
+		}
+		if size += len(rest); size > maxAuthResultsBytes {
+			return "", false
 		}
 		clauses := splitAuthResultsClauses(rest[1:])
 		if clauses == nil {

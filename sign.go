@@ -114,6 +114,9 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	// Unfold the results before choosing new fold points. Retain whitespace
 	// inside quoted values and prevent raw line breaks from reaching the AAR.
 	var authResults []string
+	if len(cfg.AuthResults) > maxAuthResultsBytes {
+		return nil, fmt.Errorf("arc: AuthResults exceeds %d bytes", maxAuthResultsBytes)
+	}
 	for _, clause := range splitAuthResultsClauses(cfg.AuthResults) {
 		authResults = append(authResults, unfoldAuthenticationResults(clause))
 	}
@@ -141,14 +144,10 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 	if defect != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedMessage, defect)
 	}
-	if domain != cfg.Domain || selector != cfg.Selector {
-		// RFC 8617 §4.1.4 permits U-labels in internationalized headers.
-		// Use A-labels when the outbound headers still fit ASCII.
-		headerBlock := raw[:len(raw)-len(body)]
-		if hasNonASCII(headerBlock) && utf8.ValidString(headerBlock) {
-			domain, selector = cfg.Domain, cfg.Selector
-		}
-	}
+	// d= and s= always carry the A-labels. U-labels are permitted in an
+	// internationalized message (RFC 8616 §4), but a verifier that does not
+	// convert them looks up a name that holds no key, and A-labels are
+	// valid everywhere.
 	if len(headers)+3 > maxHeaderFields {
 		// With the three new fields Verify would refuse the result.
 		return nil, fmt.Errorf("%w: more than %d header fields with the new ARC set", ErrMalformedMessage, maxHeaderFields)
@@ -335,6 +334,11 @@ func sign(original, outbound []byte, cfg *SignConfig, transformed bool) (*SignRe
 
 	return &SignResult{Message: []byte(out.String()), Instance: instance, CV: cv}, nil
 }
+
+// maxAuthResultsBytes bounds the results one ARC set records. An edge's
+// stamp is a few hundred bytes; the bound keeps a hostile field from costing
+// memory many times its size.
+const maxAuthResultsBytes = 64 << 10
 
 // keyDNSNames validates the signing identities and returns their DNS form.
 // The resolver requires A-labels even when the signed fields use U-labels.

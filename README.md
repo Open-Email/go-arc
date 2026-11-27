@@ -45,7 +45,7 @@ res, err := arc.Sign(rawMessage, &arc.SignConfig{
 // res.Message has the new ARC set prepended; res.Instance, res.CV
 ```
 
-The signing domain and selector accept internationalized DNS labels such as `bücher.example`. When the outgoing headers already contain UTF-8 text, the signer preserves the configured spelling in `d=` and `s=`. With ASCII headers, it emits the corresponding A-labels, such as `xn--bcher-kva.example`. Verification uses A-labels for DNS key lookups in both cases. [RFC 8617 §4.1.4](https://www.rfc-editor.org/rfc/rfc8617#section-4.1.4)
+The signing domain and selector accept internationalized DNS labels such as `bücher.example`. The signer always writes them to `d=` and `s=` as A-labels, such as `xn--bcher-kva.example`: RFC 8616 §4 permits U-labels in an internationalized message, but a verifier that does not convert them would look the key up under a name that holds none. Verification converts U-labels to A-labels for the key lookup, and uses an ASCII name as written. [RFC 8616 §4](https://www.rfc-editor.org/rfc/rfc8616#section-4)
 
 `CombinedAuthenticationResults` recognizes token and quoted forms of the configured service ID. It preserves spaces and tabs inside quoted results when collecting the fields for sealing. A fold inside a quoted service ID must decode identically at ingress and egress. For the OpenEmail ingress parser, a continuation starting with one space meets that requirement. [RFC 8601 §2.2](https://www.rfc-editor.org/rfc/rfc8601#section-2.2)
 

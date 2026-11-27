@@ -65,3 +65,78 @@ func TestAuthenticationResultsStopAtFirstDefectiveField(t *testing.T) {
 		}
 	}
 }
+
+// The combined lookup trusts only the unambiguous top of the header block,
+// refuses a block it could not read to the end, and refuses results it would
+// have to hold too much of.
+func TestCombinedAuthenticationResultsBounds(t *testing.T) {
+	const edge = "edge.example"
+	const field = "Authentication-Results: " + edge + "; dkim=pass\r\n"
+	for name, message := range map[string]string{
+		"below a malformed field":    "Subject\f: x\r\n" + field + baseMessage,
+		"below a line with no colon": "not a field\r\n" + field + baseMessage,
+		"past the field limit":       field + strings.Repeat("X-A: 1\r\n", maxHeaderFields) + baseMessage,
+		"over the size bound":        "Authentication-Results: " + edge + "; " + strings.Repeat("x=y ", maxAuthResultsBytes/4) + "\r\n" + baseMessage,
+		"over the size bound in all": strings.Repeat("Authentication-Results: "+edge+"; "+strings.Repeat("x=y ", maxAuthResultsBytes/40)+"\r\n", 12) + baseMessage,
+	} {
+		if got, ok := CombinedAuthenticationResults([]byte(message), edge); ok {
+			t.Errorf("%s: combined %.60q", name, got)
+		}
+	}
+	if got, ok := CombinedAuthenticationResults([]byte(field+"Subject\f: x\r\n"+baseMessage), edge); !ok || got != edge+"; dkim=pass" {
+		t.Errorf("a field above the defect = %q, %t", got, ok)
+	}
+	key, _, _ := testKeys(t)
+	big := edge + "; " + strings.Repeat("x=y ", maxAuthResultsBytes/4)
+	if _, err := Sign([]byte(baseMessage), signConfig(key, "forward-a.example", "sel-a", big, nil)); err == nil {
+		t.Error("Sign accepted results over the size bound")
+	}
+}
+
+// A quoted service ID is matched only as RFC 5322 decodes it: a quoted-pair
+// may escape printable ASCII and tabs, nothing else.
+func TestQuotedServiceIDsDecodeStrictly(t *testing.T) {
+	for value, want := range map[string]bool{
+		`"edge.example"; dkim=pass`:         true,
+		`"edge\.example"; dkim=pass`:        true,
+		"\"edge\\\xe9.example\"; dkim=pass": false,
+		"\"edge\\\x01.example\"; dkim=pass": false,
+		`"edge.example; dkim=pass`:          false,
+	} {
+		_, ok := CombinedAuthenticationResults([]byte("Authentication-Results: "+value+"\r\n"+baseMessage), "edge.example")
+		if ok != want {
+			t.Errorf("%q matched = %t, want %t", value, ok, want)
+		}
+	}
+	// A line break inside a quoted result becomes one space when combined,
+	// never a stray CR or LF in the sealed field.
+	got, ok := CombinedAuthenticationResults([]byte("Authentication-Results: edge.example; dkim=pass reason=\"a\r\n\tb\"\r\n"+baseMessage), "edge.example")
+	if !ok || strings.ContainsAny(got, "\r\n") || !strings.Contains(got, `"a`) {
+		t.Errorf("folded quoted result combined as %q, %t", got, ok)
+	}
+	// A stray ")" makes the results unreadable rather than shorter.
+	if got, ok := CombinedAuthenticationResults([]byte("Authentication-Results: edge.example; dkim=pass) spf=pass\r\n"+baseMessage), "edge.example"); ok {
+		t.Errorf("a stray ')' was combined as %q", got)
+	}
+}
+
+// A stray line break inside a quoted value of the results handed to Sign
+// becomes one space in the sealed field: never a raw CR or LF, and never
+// two words run together.
+func TestSignTurnsAStrayLineBreakInQuotesIntoASpace(t *testing.T) {
+	key, _, _ := testKeys(t)
+	lookup := dnsStub(map[string]string{"sel-a._domainkey.forward-a.example": txtFor(t, key)})
+	for _, br := range []string{"\r", "\n", "\r\n"} {
+		results := "mx.forward-a.example; dkim=pass reason=\"a" + br + "b\""
+		sealed, err := Sign([]byte(baseMessage), signConfig(key, "forward-a.example", "sel-a", results, lookup))
+		if err != nil {
+			t.Fatalf("%q: %v", br, err)
+		}
+		if _, payload, ok := LatestARCAuthResults(sealed.Message); !ok || !strings.Contains(payload, `reason="a b"`) {
+			t.Errorf("%q: sealed results %q", br, payload)
+		}
+		if !mustVerify(t, sealed.Message, lookup).Pass {
+			t.Errorf("%q: the seal does not verify", br)
+		}
+	}
+}
